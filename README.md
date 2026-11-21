@@ -154,6 +154,13 @@ family, Lanczos-2/3/4, windowed-sinc and Gaussian filters found nothing better. 
 background all three reduce fringing by a similar 17–18%. **On WOLED keep Sharp**: the other two
 blur text there.
 
+### Strength on QD-OLED
+
+`tools/sim_qd_strength.py` sweeps strength from 0.5 to 1.2 on every measured QD-OLED class. For all
+of them, fringing reduction peaks at 1.00–1.10 and sharpness peaks at 0.90–1.00, with both falling
+off above that (overshoot). So **1.00 is the best setting** for every filter, and the presets use it.
+Going lower only gives up fringing reduction: at 0.70 it is about 45% instead of 58% with Sharp.
+
 ## ClearType
 
 ClearType can stay on, but then turn on **ClearType-compatible mode**: ClearType already shifts
@@ -208,6 +215,22 @@ overlay; try toggling "Fully opaque overlay" or another Processing GPU, and repo
 - `Ctrl+Alt+F`: toggle the effect. Press this first if anything goes wrong.
 - `Ctrl+Alt+C`: open Settings.
 - Tray icon: click for Settings; right-click lists the presets.
+
+## Updates
+
+About 20 seconds after start, and then once a day, the app asks GitHub for the latest release. If it
+is newer, the app downloads `OLEDTextFix.exe` and its `.sha256` from that release over HTTPS,
+verifies the hash, and replaces its own exe (the old copy is kept as `OLEDTextFix.exe.old` until the
+next start). A notification appears; choose **Restart to finish updating** in the tray menu to use
+the new version. Your settings are kept.
+
+- The tray menu has **Check for updates now** and **Check for updates automatically** (on by
+  default; stored as `CheckForUpdates` in the INI). Nothing else is sent: the only requests are to
+  `api.github.com` and `github.com`.
+- If the exe sits in a folder you cannot write to (for example `Program Files`), the menu shows a link
+  to the download page instead.
+- The hash comes from the same release as the exe, so it catches corrupted downloads, not a
+  compromised release.
 
 ## Known limitations
 

@@ -34,6 +34,8 @@
 #include <dxgi1_6.h>
 #include <dcomp.h>
 #include <d3dcompiler.h>
+#include <winhttp.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <atomic>
@@ -126,6 +128,7 @@ struct Config {
     int motionFrames = 3;    // this many changed frames...
     int motionWindowMs = 120;  // ...within this window count as "motion"
     int motionSettleMs = 250;  // re-apply the correction this long after motion stops
+    int updateCheck = 1;       // look for a newer release on GitHub and install it
 };
 
 struct Preset {
@@ -254,6 +257,7 @@ static void LoadConfig() {
     c.enabled = IniInt(L"General", L"Enabled", c.enabled);
     c.autoSuspend = IniInt(L"General", L"AutoSuspendFullscreen", c.autoSuspend);
     c.overlayAlpha = IniInt(L"General", L"OverlayAlpha", c.overlayAlpha);
+    c.updateCheck = IniInt(L"General", L"CheckForUpdates", c.updateCheck);
     GetPrivateProfileStringW(L"General", L"Preset", c.preset, c.preset, 64, g_iniPath);
     GetPrivateProfileStringW(L"Performance", L"Gpu", c.gpu, c.gpu, 128, g_iniPath);
     c.fpsCap = IniInt(L"Performance", L"FpsCap", c.fpsCap);
@@ -281,6 +285,7 @@ static void SaveConfig() {
     IniPutI(L"General", L"Enabled", c.enabled);
     IniPutI(L"General", L"AutoSuspendFullscreen", c.autoSuspend);
     IniPutI(L"General", L"OverlayAlpha", c.overlayAlpha);
+    IniPutI(L"General", L"CheckForUpdates", c.updateCheck);
     WritePrivateProfileStringW(L"General", L"Preset", c.preset, g_iniPath);
     WritePrivateProfileStringW(L"Performance", L"Gpu", c.gpu, g_iniPath);
     IniPutI(L"Performance", L"FpsCap", c.fpsCap);
@@ -357,6 +362,7 @@ static HICON g_icon;
 static RECT g_monRect;  // UI thread uses after render thread sets (via message)
 static const UINT WM_TRAY = WM_APP + 1;
 static const UINT WM_APP_SETRECT = WM_APP + 2;
+static const UINT WM_APP_UPDATE = WM_APP + 3;
 static UINT WM_TASKBARCREATED;
 
 // ---------------------------------------------------------------- monitor enumeration
@@ -1463,10 +1469,211 @@ static void ApplyPreset(int i) {
     SyncControls();
 }
 
+// ---------------------------------------------------------------- self-update
+
+// Looks at the latest GitHub release; if it is newer, downloads OLEDTextFix.exe and its .sha256 from
+// that release over HTTPS, checks the hash, and swaps the exe in place (a running exe can be renamed,
+// so the old copy moves to OLEDTextFix.exe.old and is deleted on the next start). The new version
+// takes effect after a restart (tray menu).
+#ifndef APP_VERSION
+#define APP_VERSION "1.0"
+#endif
+#define WL2_(x) L##x
+#define WL_(x) WL2_(x)
+static const wchar_t* kRepo = L"/oguz463/OLEDTextFix";
+static const wchar_t* kReleasesPage = L"https://github.com/oguz463/OLEDTextFix/releases/latest";
+
+enum UpdState { UPD_IDLE = 0, UPD_BUSY, UPD_UPTODATE, UPD_READY, UPD_MANUAL, UPD_FAILED };
+static std::atomic<int> g_updState{UPD_IDLE};
+static wchar_t g_updVer[40];
+
+static bool ParseVersion(const char* s, std::vector<int>& v) {
+    v.clear();
+    if (*s == 'v' || *s == 'V') s++;
+    if (!isdigit((unsigned char)*s)) return false;
+    while (*s) {
+        if (!isdigit((unsigned char)*s)) break;
+        int n = 0;
+        while (isdigit((unsigned char)*s) && n < 100000) n = n * 10 + (*s++ - '0');
+        v.push_back(n);
+        if (*s != '.') break;
+        s++;
+    }
+    return !v.empty();
+}
+static bool IsNewerVersion(const char* tag, const char* cur) {
+    std::vector<int> a, b;
+    if (!ParseVersion(tag, a) || !ParseVersion(cur, b)) return false;
+    size_t n = std::max(a.size(), b.size());
+    a.resize(n, 0);
+    b.resize(n, 0);
+    return std::lexicographical_compare(b.begin(), b.end(), a.begin(), a.end());
+}
+
+static bool HttpGet(const wchar_t* host, const std::wstring& path, std::string& out, size_t maxBytes) {
+    out.clear();
+    bool ok = false;
+    HINTERNET ses = WinHttpOpen(L"OLEDTextFix/" WL_(APP_VERSION), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, nullptr, nullptr, 0);
+    if (!ses) return false;
+    WinHttpSetTimeouts(ses, 10000, 10000, 20000, 60000);
+    HINTERNET con = WinHttpConnect(ses, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET req = con ? WinHttpOpenRequest(con, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                             WINHTTP_FLAG_SECURE)
+                        : nullptr;
+    if (req && WinHttpSendRequest(req, L"Accept: application/vnd.github+json\r\n", (DWORD)-1L, nullptr, 0, 0, 0) &&
+        WinHttpReceiveResponse(req, nullptr)) {
+        DWORD code = 0, sz = sizeof(code);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &code, &sz, nullptr);
+        if (code == 200) {
+            ok = true;
+            for (;;) {
+                DWORD avail = 0;
+                if (!WinHttpQueryDataAvailable(req, &avail)) { ok = false; break; }
+                if (avail == 0) break;
+                if (out.size() + avail > maxBytes) { ok = false; break; }
+                size_t at = out.size();
+                out.resize(at + avail);
+                DWORD got = 0;
+                if (!WinHttpReadData(req, &out[at], avail, &got)) { ok = false; break; }
+                out.resize(at + got);
+            }
+        } else {
+            Log("Update: HTTP %lu for %ls", code, path.c_str());
+        }
+    }
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    WinHttpCloseHandle(ses);
+    return ok;
+}
+
+static bool Sha256Hex(const std::string& data, std::string& hex) {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) return false;
+    UCHAR h[32];
+    NTSTATUS st = BCryptHash(alg, nullptr, 0, (PUCHAR)data.data(), (ULONG)data.size(), h, 32);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    if (st < 0) return false;
+    static const char* d = "0123456789abcdef";
+    hex.clear();
+    for (UCHAR b : h) { hex += d[b >> 4]; hex += d[b & 15]; }
+    return true;
+}
+
+static DWORD WINAPI UpdateThread(LPVOID) {
+    auto finish = [](int st) {
+        g_updState = st;
+        PostMessageW(g_msgWnd, WM_APP_UPDATE, st, 0);
+    };
+    std::string json;
+    if (!HttpGet(L"api.github.com", std::wstring(L"/repos") + kRepo + L"/releases/latest", json, 1 << 20)) {
+        Log("Update: could not reach GitHub");
+        finish(UPD_FAILED);
+        return 0;
+    }
+    char tag[40] = {};
+    size_t k = json.find("\"tag_name\"");
+    if (k != std::string::npos) {
+        k = json.find('"', json.find(':', k) + 1);
+        size_t e = k == std::string::npos ? k : json.find('"', k + 1);
+        if (e != std::string::npos && e - k - 1 < sizeof(tag)) json.copy(tag, e - k - 1, k + 1);
+    }
+    for (char* q = tag; *q; q++)  // the tag ends up in a URL: only plain characters
+        if (!(isalnum((unsigned char)*q) || *q == '.' || *q == '-' || *q == '_')) { tag[0] = 0; break; }
+    if (!tag[0]) { Log("Update: no usable tag in the response"); finish(UPD_FAILED); return 0; }
+    if (!IsNewerVersion(tag, APP_VERSION)) {
+        Log("Update: %s is the latest (running %s)", tag, APP_VERSION);
+        finish(UPD_UPTODATE);
+        return 0;
+    }
+    MultiByteToWideChar(CP_UTF8, 0, tag, -1, g_updVer, 40);
+    Log("Update: %s is available (running %s)", tag, APP_VERSION);
+
+    std::wstring base = std::wstring(kRepo) + L"/releases/download/" + g_updVer + L"/";
+    std::string exe, sum;
+    if (!HttpGet(L"github.com", base + L"OLEDTextFix.exe", exe, 64u << 20) || !HttpGet(L"github.com", base + L"OLEDTextFix.exe.sha256", sum, 4096)) {
+        Log("Update: release has no downloadable exe/hash; manual update needed");
+        finish(UPD_MANUAL);
+        return 0;
+    }
+    std::string hex;
+    bool good = exe.size() > 100000 && exe[0] == 'M' && exe[1] == 'Z' && sum.size() >= 64 && Sha256Hex(exe, hex);
+    if (good) {
+        for (int i = 0; i < 64; i++)
+            if (tolower((unsigned char)sum[i]) != hex[i]) { good = false; break; }
+    }
+    if (!good) { Log("Update: downloaded file failed the integrity check"); finish(UPD_FAILED); return 0; }
+
+    std::wstring nw = std::wstring(g_exePath) + L".new", old = std::wstring(g_exePath) + L".old";
+    HANDLE f = CreateFileW(nw.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD wr = 0;
+    bool wrote = f != INVALID_HANDLE_VALUE && WriteFile(f, exe.data(), (DWORD)exe.size(), &wr, nullptr) && wr == exe.size();
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    if (!wrote) { Log("Update: cannot write next to the exe (%lu)", GetLastError()); DeleteFileW(nw.c_str()); finish(UPD_MANUAL); return 0; }
+    DeleteFileW(old.c_str());
+    if (!MoveFileExW(g_exePath, old.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        Log("Update: cannot rename the running exe (%lu)", GetLastError());
+        DeleteFileW(nw.c_str());
+        finish(UPD_MANUAL);
+        return 0;
+    }
+    if (!MoveFileExW(nw.c_str(), g_exePath, 0)) {
+        Log("Update: cannot move the new exe into place (%lu); rolling back", GetLastError());
+        MoveFileExW(old.c_str(), g_exePath, MOVEFILE_REPLACE_EXISTING);
+        DeleteFileW(nw.c_str());
+        finish(UPD_FAILED);
+        return 0;
+    }
+    Log("Update: installed %ls, restart to use it", g_updVer);
+    finish(UPD_READY);
+    return 0;
+}
+
+static void StartUpdateCheck() {
+    int idle = UPD_IDLE;
+    int cur = g_updState.load();
+    if (cur == UPD_BUSY || cur == UPD_READY) return;
+    (void)idle;
+    g_updState = UPD_BUSY;
+    HANDLE t = CreateThread(nullptr, 0, UpdateThread, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+    else g_updState = UPD_FAILED;
+}
+
+static void TrayBalloon(const wchar_t* title, const wchar_t* text) {
+    NOTIFYICONDATAW n{};
+    n.cbSize = sizeof(n);
+    n.hWnd = g_msgWnd;
+    n.uID = 1;
+    n.uFlags = NIF_INFO;
+    n.dwInfoFlags = NIIF_INFO;
+    wcsncpy(n.szInfoTitle, title, 63);
+    wcsncpy(n.szInfo, text, 255);
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
+static bool g_updManual = false;  // the check was started from the menu: report "up to date" / errors too
+
+static void OnUpdateResult(int st) {
+    wchar_t b[256];
+    if (st == UPD_READY) {
+        swprintf(b, 256, L"%ls is installed. Right-click the tray icon and choose \"Restart to finish updating\".", g_updVer);
+        TrayBalloon(L"OLEDTextFix updated", b);
+    } else if (st == UPD_MANUAL) {
+        swprintf(b, 256, L"%ls is available. Right-click the tray icon to open the download page.", g_updVer);
+        TrayBalloon(L"OLEDTextFix update available", b);
+    } else if (g_updManual && st == UPD_UPTODATE) {
+        TrayBalloon(L"OLEDTextFix", L"You have the latest version (" WL_(APP_VERSION) L").");
+    } else if (g_updManual && st == UPD_FAILED) {
+        TrayBalloon(L"OLEDTextFix", L"Could not check for updates. See OLEDTextFix.log.");
+    }
+    g_updManual = false;
+}
+
 // ---------------------------------------------------------------- tray menu
 
 enum {
-    ID_ENABLE = 100, ID_SETTINGS, ID_EXIT,
+    ID_ENABLE = 100, ID_SETTINGS, ID_EXIT, ID_UPD_CHECK, ID_UPD_AUTO, ID_UPD_RESTART, ID_UPD_OPEN,
     ID_PRESET0 = 300,  // ..399
     HK_TOGGLE = 1, HK_CAL = 2,
 };
@@ -1476,7 +1683,7 @@ static void ShowTrayMenu() {
     LoadPresets();
     HMENU m = CreatePopupMenu();
     wchar_t st[160];
-    swprintf(st, 160, L"Status: %ls", StatusText());
+    swprintf(st, 160, L"Status: %ls  (v%ls)", StatusText(), WL_(APP_VERSION));
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, st);
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (c.enabled ? MF_CHECKED : 0), ID_ENABLE, L"Enabled\tCtrl+Alt+F");
@@ -1487,6 +1694,20 @@ static void ShowTrayMenu() {
         AppendMenuW(pm, MF_STRING | (g_presets[i].name == c.preset ? MF_CHECKED : 0), ID_PRESET0 + i, g_presets[i].name.c_str());
     }
     AppendMenuW(m, MF_POPUP, (UINT_PTR)pm, L"Preset");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    int us = g_updState.load();
+    if (us == UPD_READY) {
+        wchar_t t[96];
+        swprintf(t, 96, L"Restart to finish updating to %ls", g_updVer);
+        AppendMenuW(m, MF_STRING, ID_UPD_RESTART, t);
+    } else if (us == UPD_MANUAL) {
+        wchar_t t[96];
+        swprintf(t, 96, L"%ls is available — open download page", g_updVer);
+        AppendMenuW(m, MF_STRING, ID_UPD_OPEN, t);
+    } else {
+        AppendMenuW(m, MF_STRING | (us == UPD_BUSY ? MF_GRAYED : 0), ID_UPD_CHECK, us == UPD_BUSY ? L"Checking for updates..." : L"Check for updates now");
+    }
+    AppendMenuW(m, MF_STRING | (c.updateCheck ? MF_CHECKED : 0), ID_UPD_AUTO, L"Check for updates automatically");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
 
@@ -1505,6 +1726,18 @@ static void HandleTrayCommand(UINT id) {
         SyncControls();
     } else if (id == ID_SETTINGS) {
         OpenSettings();
+    } else if (id == ID_UPD_CHECK) {
+        g_updManual = true;
+        StartUpdateCheck();
+    } else if (id == ID_UPD_AUTO) {
+        EditCfg([](Config& c) { c.updateCheck = !c.updateCheck; });
+        SaveConfig();
+    } else if (id == ID_UPD_OPEN) {
+        ShellExecuteW(nullptr, L"open", kReleasesPage, nullptr, nullptr, SW_SHOWNORMAL);
+    } else if (id == ID_UPD_RESTART) {
+        SaveConfig();
+        ShellExecuteW(nullptr, L"open", g_exePath, L"/restarted", g_exeDir, SW_SHOWNORMAL);
+        DestroyWindow(g_msgWnd);
     } else if (id == ID_EXIT) {
         SaveConfig();
         DestroyWindow(g_msgWnd);
@@ -1691,13 +1924,13 @@ static void Layout() {
     Place(g_ui.btnSave, x, y, S(110), S(28));
     Place(g_ui.btnDefaults, x + S(118), y, S(150), S(28));
     Place(g_ui.btnClose, x + w - S(100), y, S(100), S(28)); y += S(36);
-    Place(g_ui.lblStatus, x, y, w, S(54));
+    Place(g_ui.lblStatus, x, y, w, std::max(S(54), (int)rc.bottom - y - S(4)));
 
     int px = x + w + S(14);
     Place(g_ui.pattern, px, 0, std::max(10, (int)rc.right - px), rc.bottom);
 }
 
-static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 905;
+static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 935;
 
 static void ResizeForDpi() {
     RECT r{0, 0, S(kClientW), S(kClientH)};
@@ -1814,7 +2047,7 @@ static void UpdateStatusLabel() {
     if (!g_ui.wnd) return;
     wchar_t b[512];
     if (g_cross)
-        swprintf(b, 512, L"Status: %ls\nProcessed %d · skipped %d · captured %d fps\nCapture: %ls → Processing: %ls (cross-adapter)", StatusText(),
+        swprintf(b, 512, L"Status: %ls\nProcessed %d · skipped %d · captured %d fps\nCapture GPU: %ls\nProcessing GPU: %ls (cross-adapter)", StatusText(),
                  g_fps.load(), g_skipFps.load(), g_ddaFps.load(), g_capGpuName, g_gpuName);
     else
         swprintf(b, 512, L"Status: %ls\nProcessed %d · skipped %d · captured %d fps · moving %d tiles\nGPU: %ls", StatusText(),
@@ -2024,7 +2257,9 @@ static void DrawPattern(HWND hwnd, HDC hdc) {
             HFONT f = CreateFontW(-P(px), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, quality, 0, face);
             HGDIOBJ of = SelectObject(mdc, f);
             SetTextColor(mdc, col);
-            TextOutW(mdc, xx, yy, s, (int)wcslen(s));
+            // clip to this half of the pane so long lines never spill into the other column
+            RECT clip{xx, yy, (xx >= W / 2 ? W : W / 2) - P(4), yy + P(px) * 2};
+            ExtTextOutW(mdc, xx, yy, ETO_CLIPPED, &clip, s, (UINT)wcslen(s), nullptr);
             SelectObject(mdc, of);
             DeleteObject(f);
         };
@@ -2037,8 +2272,19 @@ static void DrawPattern(HWND hwnd, HDC hdc) {
             text(L"Segoe UI", s, CLEARTYPE_QUALITY, fg, sample, W / 2 + x, y);
             y += P(s + 8);
         }
-        text(L"Consolas", 14, ANTIALIASED_QUALITY, fg, code, x, y);
-        text(L"Consolas", 14, CLEARTYPE_QUALITY, fg, code, W / 2 + x, y);
+        // shrink the code line until it fits in half the pane
+        int codePx = 14;
+        for (; codePx > 8; codePx--) {
+            HFONT f = CreateFontW(-P(codePx), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Consolas");
+            HGDIOBJ of = SelectObject(mdc, f);
+            SIZE sz{};
+            GetTextExtentPoint32W(mdc, code, (int)wcslen(code), &sz);
+            SelectObject(mdc, of);
+            DeleteObject(f);
+            if (sz.cx <= W / 2 - 2 * x) break;
+        }
+        text(L"Consolas", codePx, ANTIALIASED_QUALITY, fg, code, x, y);
+        text(L"Consolas", codePx, CLEARTYPE_QUALITY, fg, code, W / 2 + x, y);
         y += P(26);
         // thin horizontal lines (green-top / magenta-bottom fringe test) and vertical lines
         HBRUSH line = dark ? wh : bk;
@@ -2099,6 +2345,7 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) OpenSettings();
             return 0;
         case WM_COMMAND: HandleTrayCommand(LOWORD(wp)); return 0;
+        case WM_APP_UPDATE: OnUpdateResult((int)wp); return 0;
         case WM_HOTKEY:
             if (wp == HK_TOGGLE) {
                 EditCfg([](Config& c) { c.enabled = !c.enabled; });
@@ -2120,6 +2367,11 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_TIMER: {
+            if (wp == 2) {  // update check: 20 s after start, then every 24 h
+                SetTimer(g_msgWnd, 2, 24 * 60 * 60 * 1000, nullptr);
+                if (GetCfg().updateCheck) StartUpdateCheck();
+                return 0;
+            }
             Config c = GetCfg();
             // fullscreen detection: require 2 consecutive readings to avoid toggling (flicker)
             bool fs = c.autoSuspend && IsFullscreenAppOnTarget();
@@ -2208,10 +2460,14 @@ static void AutoPickPreset() {
     if (name) ApplyPreset(FindPreset(name));
 }
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_inst = inst;
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Local\\OLEDTextFix.SingleInstance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (GetLastError() == ERROR_ALREADY_EXISTS && cmdLine && wcsstr(cmdLine, L"/restarted")) {
+        // started by "Restart to finish updating": wait for the old instance to exit, then take over
+        DWORD w = WaitForSingleObject(mtx, 10000);
+        if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) return 0;
+    } else if (GetLastError() == ERROR_ALREADY_EXISTS) {
         // if already running, ask it to open the settings window
         if (HWND w = FindWindowW(L"OLEDTextFixMsg", nullptr)) PostMessageW(w, WM_HOTKEY, HK_CAL, 0);
         return 0;
@@ -2234,7 +2490,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         FILE* f = _wfopen(g_logPath, L"w");
         if (f) fclose(f);
     }
-    Log("OLEDTextFix started");
+    Log("OLEDTextFix started (v%s)", APP_VERSION);
+    {
+        std::wstring leftovers[] = {std::wstring(g_exePath) + L".old", std::wstring(g_exePath) + L".new"};
+        for (auto& l : leftovers) DeleteFileW(l.c_str());  // from an earlier update
+    }
     // Migrate from the old name (QDTextFix): settings file and "Start with Windows" entry
     {
         // If the old QDTextFix is still running, ask it to exit (it saves its settings first)
@@ -2310,6 +2570,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     RegisterHotKey(g_msgWnd, HK_TOGGLE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
     RegisterHotKey(g_msgWnd, HK_CAL, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
     SetTimer(g_msgWnd, 1, 250, nullptr);
+    SetTimer(g_msgWnd, 2, 20000, nullptr);
 
     HANDLE th = CreateThread(nullptr, 0, RenderThread, nullptr, 0, nullptr);
 
