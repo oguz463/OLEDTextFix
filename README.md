@@ -156,10 +156,13 @@ blur text there.
 
 ### Strength on QD-OLED
 
-`tools/sim_qd_strength.py` sweeps strength from 0.5 to 1.2 on every measured QD-OLED class. For all
-of them, fringing reduction peaks at 1.00–1.10 and sharpness peaks at 0.90–1.00, with both falling
-off above that (overshoot). So **1.00 is the best setting** for every filter, and the presets use it.
-Going lower only gives up fringing reduction: at 0.70 it is about 45% instead of 58% with Sharp.
+`tools/sim_qd_strength.py` sweeps strength from 0.5 to 1.2 on every measured QD-OLED class. In the
+simulation, fringing reduction peaks at 1.00–1.10 and falls off above that (overshoot), so 1.00 is
+the most accurate setting. It is also the one that softens text the most, because the red and blue
+channels are moved by about half a pixel vertically. The presets therefore use **0.80**, which keeps
+roughly 88% of the fringing reduction (about 51% instead of 58% with Sharp, dark background) and
+looks crisper. Raise **Strength** towards 1.00 if colour fringes bother you more than softness;
+lower it if text still looks soft. Settings you have already saved are not changed.
 
 ## ClearType
 
