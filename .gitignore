@@ -1,0 +1,11 @@
+# build outputs
+*.exe
+*.o
+*.obj
+*.res
+dist/
+# runtime files
+OLEDTextFix.ini
+OLEDTextFix.log
+# Python
+__pycache__/
