@@ -113,7 +113,7 @@ struct Config {
     // Physical position of each channel's subpixel relative to the pixel centre (in pixels)
     // [channel R,G,B][x,y]   (y positive downwards)
     float off[3][2] = {{-0.22f, 0.50f}, {0.0f, 0.0f}, {0.27f, 0.52f}};
-    float strength = 1.0f;
+    float strength = 0.80f;
     int kernel = K_CATMULL;
     int linear = 1;          // process in linear light (physically correct)
     int cleartype = 0;       // ClearType-compatible mode: account for ClearType's own horizontal shift
@@ -153,17 +153,17 @@ struct Preset {
 #define WO_RGWB {{-0.50f, 0.0f}, {-0.25f, 0.0f}, {0.22f, 0.0f}}  // R G W B: 6 photos
 
 static const Preset kBuiltinPresets[] = {
-    {L"27\" 1440p 240/280 Hz QD-OLED", QD_27QHD, 1.00f, K_CATMULL, true},
-    {L"27\" 1440p 360 Hz QD-OLED (Gen 3, 2024)", QD_27QHD, 1.00f, K_CATMULL, true},
-    {L"27\" 1440p 500 Hz QD-OLED (Gen 3 update, 2025)", QD_27QHD, 1.00f, K_CATMULL, true},
-    {L"27\" 4K 240 Hz QD-OLED (Gen 4, 2025)", QD_27_4K, 1.00f, K_CATMULL, true},
-    {L"32\" 4K 165 Hz QD-OLED", QD_32_4K, 1.00f, K_CATMULL, true},
-    {L"32\" 4K 240 Hz QD-OLED (Gen 3, 2024)", QD_32_4K, 1.00f, K_CATMULL, true},
-    {L"34\" 3440x1440 165/175 Hz QD-OLED (Gen 1, 2022)", QD_UW34, 1.00f, K_CATMULL, true},
-    {L"34\" 3440x1440 240 Hz QD-OLED (Gen 2, 2024)", QD_UW34, 1.00f, K_CATMULL, true},
-    {L"49\" 5120x1440 144/240 Hz QD-OLED (Gen 2, 2023)", QD_SUW49, 1.00f, K_CATMULL, true},
-    {L"Any QD-OLED triad — vertical only", {{0.0f, 0.50f}, {0.0f, 0.0f}, {0.0f, 0.50f}}, 1.00f, K_CATMULL, true},
-    {L"QD-OLED legacy estimate (early QDTextFix default)", {{-0.20f, 0.20f}, {0.0f, -0.20f}, {0.20f, 0.20f}}, 1.00f, K_CATMULL, true},
+    {L"27\" 1440p 240/280 Hz QD-OLED", QD_27QHD, 0.80f, K_CATMULL, true},
+    {L"27\" 1440p 360 Hz QD-OLED (Gen 3, 2024)", QD_27QHD, 0.80f, K_CATMULL, true},
+    {L"27\" 1440p 500 Hz QD-OLED (Gen 3 update, 2025)", QD_27QHD, 0.80f, K_CATMULL, true},
+    {L"27\" 4K 240 Hz QD-OLED (Gen 4, 2025)", QD_27_4K, 0.80f, K_CATMULL, true},
+    {L"32\" 4K 165 Hz QD-OLED", QD_32_4K, 0.80f, K_CATMULL, true},
+    {L"32\" 4K 240 Hz QD-OLED (Gen 3, 2024)", QD_32_4K, 0.80f, K_CATMULL, true},
+    {L"34\" 3440x1440 165/175 Hz QD-OLED (Gen 1, 2022)", QD_UW34, 0.80f, K_CATMULL, true},
+    {L"34\" 3440x1440 240 Hz QD-OLED (Gen 2, 2024)", QD_UW34, 0.80f, K_CATMULL, true},
+    {L"49\" 5120x1440 144/240 Hz QD-OLED (Gen 2, 2023)", QD_SUW49, 0.80f, K_CATMULL, true},
+    {L"Any QD-OLED triad — vertical only", {{0.0f, 0.50f}, {0.0f, 0.0f}, {0.0f, 0.50f}}, 0.80f, K_CATMULL, true},
+    {L"QD-OLED legacy estimate (early QDTextFix default)", {{-0.20f, 0.20f}, {0.0f, -0.20f}, {0.20f, 0.20f}}, 0.80f, K_CATMULL, true},
     // LG WOLED: each pixel is four vertical columns, R W B G (older panels) or R G W B (2024+). Positions
     // are taken relative to the white column: the panel derives white from the input itself, so keeping it
     // as the reference preserves sharpness (see tools/sim_woled.py). Above ~0.25 strength fringing can get
