@@ -2361,8 +2361,10 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             mi.cbSize = sizeof(mi);
             if (mon && GetMonitorInfoW(mon, &mi)) {
                 g_monRect = mi.rcMonitor;
+                // One pixel row short of the monitor: a topmost window that covers the whole monitor is
+                // treated by the shell as a fullscreen app, which pushes the taskbar behind other windows.
                 SetWindowPos(g_overlay, HWND_TOPMOST, g_monRect.left, g_monRect.top, g_monRect.right - g_monRect.left,
-                             g_monRect.bottom - g_monRect.top, SWP_NOACTIVATE);
+                             g_monRect.bottom - g_monRect.top - 1, SWP_NOACTIVATE);
             }
             return 0;
         }
