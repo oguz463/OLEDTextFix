@@ -23,8 +23,8 @@ zip and run `OLEDTextFix.exe`. Releases are built automatically by GitHub Action
 repository. The executable is not code-signed, so Windows SmartScreen may show a warning the first
 time; choose "More info" → "Run anyway", or right-click the file → Properties → **Unblock**.
 
-Requirements: Windows 10 version 2004 or later, or Windows 11; a DirectX 11 GPU; HDR off (the
-app works in SDR and pauses itself while HDR is on).
+Requirements: Windows 10 version 2004 or later, or Windows 11; a DirectX 11 GPU. HDR is
+**experimental** (see [HDR and Auto Color Management](#hdr-and-auto-color-management)).
 
 ## Why OLED text has colour fringes
 
@@ -135,7 +135,8 @@ MSI MPG 341CQR X36, ASUS PG27UCWM / PG32UCWM). Normal ClearType works well on th
 The preset is picked from resolution, refresh rate, physical size and the monitor's manufacturer
 code (LG-branded OLED monitors use WOLED; 480 Hz at 1440p is WOLED; 39" and 45" ultrawides are
 WOLED). Other brands' WOLED monitors with the same size and refresh rate as a QD-OLED (e.g. ASUS
-PG27AQDM, PG32UCDP) need the preset chosen by hand.
+PG27AQDM, PG27AQDP, PG27AQWP, PG32UCDP) need the preset chosen by hand. The app shows a notification with
+the auto-picked preset on those brands so you can check it.
 
 ## Filters
 
@@ -213,6 +214,23 @@ and power is still higher, the GPU may be keeping its memory clock up because of
 overlay; try toggling "Fully opaque overlay" or another Processing GPU, and report the result with
 `OLEDTextFix.log`.
 
+### HDR and Auto Color Management
+
+When HDR or Windows 11's **Auto Color Management** (Settings → Display → Advanced display →
+"Automatically manage color for apps") is on, Windows composes the desktop in a 16-bit floating-point
+format (scRGB) instead of 8-bit. The app captures that format directly, resamples it in linear light
+and shows the result in a matching overlay, so the colours are left unchanged.
+
+- **Auto Color Management** is handled automatically. If the status line says the format is
+  unsupported, send the log (`OLEDTextFix.log`) with the line "Unsupported desktop format".
+- **HDR** is experimental: tick *Experimental: process HDR desktops* in Settings. It is off by
+  default and, if it cannot capture, the app pauses as before. HDR content itself (video, games) is
+  processed too, which is unnecessary; only SDR text benefits.
+- In these modes the Processing GPU setting is ignored (the monitor's GPU is used) and the
+  linear-light option has no effect (the data is already linear).
+- Not verified on a wide range of setups yet. Reports with your GPU, monitor and the log are very
+  welcome.
+
 ## Shortcuts
 
 - `Ctrl+Alt+F`: toggle the effect. Press this first if anything goes wrong.
@@ -237,7 +255,7 @@ the new version. Your settings are kept.
 
 ## Known limitations
 
-- **SDR only**; pauses while HDR is on.
+- **HDR is experimental** and off by default; with it off the app pauses while HDR is on.
 - The corrected image is about **one frame behind** (~4 ms at 240 Hz) while the cursor is not, so
   a dragged window can feel slightly heavy. "Show moving regions without latency" removes this
   wherever something is moving.
@@ -267,6 +285,13 @@ subpixel. Please share your measurements in [Issues](https://github.com/oguz463/
 - **Flicker:** turn "Fully opaque overlay" off (some drivers flicker when Windows moves the overlay
   to a hardware plane), set Processing GPU to Automatic and Frame cap to Unlimited. The "Overlay
   hidden" and "Fullscreen pause" lines in `OLEDTextFix.log` show why the overlay was hidden.
+- **"Paused" with HDR on, or the status line mentions the desktop format:** see
+  [HDR and Auto Color Management](#hdr-and-auto-color-management). If HDR is off and it still says
+  so, turn "Automatically manage color for apps" off and on again and send the log.
+- **No visible difference on a WOLED monitor:** check the preset in Settings. On brands other than
+  LG the first-run auto-pick cannot tell WOLED from QD-OLED, so it may have chosen a QD-OLED preset
+  (the app shows a notification with the choice). Select the matching WOLED preset by hand; WOLED
+  corrections are mild (strength 0.20), so toggle **Compare** and look closely.
 - **Screen looks frozen or wrong:** press `Ctrl+Alt+F` and check `OLEDTextFix.log`.
 - **Image gets progressively blurrier:** the overlay is capturing itself; this happens on Windows
   older than 10 version 2004.

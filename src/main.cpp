@@ -128,6 +128,7 @@ struct Config {
     int motionWindowMs = 120;  // ...within this window count as "motion"
     int motionSettleMs = 250;  // re-apply the correction this long after motion stops
     int updateCheck = 1;       // look for a newer release on GitHub and install it
+    int hdr = 0;               // experimental: process HDR (scRGB) desktops instead of pausing
 };
 
 struct Preset {
@@ -257,6 +258,7 @@ static void LoadConfig() {
     c.autoSuspend = IniInt(L"General", L"AutoSuspendFullscreen", c.autoSuspend);
     c.overlayAlpha = IniInt(L"General", L"OverlayAlpha", c.overlayAlpha);
     c.updateCheck = IniInt(L"General", L"CheckForUpdates", c.updateCheck);
+    c.hdr = IniInt(L"General", L"ExperimentalHDR", c.hdr);
     GetPrivateProfileStringW(L"General", L"Preset", c.preset, c.preset, 64, g_iniPath);
     GetPrivateProfileStringW(L"Performance", L"Gpu", c.gpu, c.gpu, 128, g_iniPath);
     c.fpsCap = IniInt(L"Performance", L"FpsCap", c.fpsCap);
@@ -284,6 +286,7 @@ static void SaveConfig() {
     IniPutI(L"General", L"AutoSuspendFullscreen", c.autoSuspend);
     IniPutI(L"General", L"OverlayAlpha", c.overlayAlpha);
     IniPutI(L"General", L"CheckForUpdates", c.updateCheck);
+    IniPutI(L"General", L"ExperimentalHDR", c.hdr);
     WritePrivateProfileStringW(L"General", L"Preset", c.preset, g_iniPath);
     WritePrivateProfileStringW(L"Performance", L"Gpu", c.gpu, g_iniPath);
     IniPutI(L"Performance", L"FpsCap", c.fpsCap);
@@ -341,7 +344,7 @@ static void DeleteUserPreset(const std::wstring& name) {
 
 // ---------------------------------------------------------------- global state
 
-enum Status { ST_STARTING, ST_ACTIVE, ST_DISABLED, ST_FULLSCREEN, ST_HDR, ST_WAITING, ST_ERROR };
+enum Status { ST_STARTING, ST_ACTIVE, ST_DISABLED, ST_FULLSCREEN, ST_HDR, ST_WAITING, ST_ERROR, ST_FORMAT };
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_forceRedraw{true};
 static std::atomic<bool> g_bypass{false};
@@ -492,6 +495,8 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target {
             b += wxB[i] * wyB[j] * tex.Load(int3(clamp(p + baseB.xy + o, int2(0, 0), sz.xy), 0)).b;
         }
     }
+    // HDR / Advanced Color desktops are scRGB (linear, FP16): values above 1 and below 0 are valid
+    if (tileInfo.y != 0) return float4(r, g, b, 1.0);
     return float4(saturate(float3(r, g, b)), 1.0);
 }
 )HLSL";
@@ -533,6 +538,24 @@ static bool SameLuid(const LUID& a, const LUID& b) { return a.LowPart == b.LowPa
 
 static D3D11_BOX BoxOf(const RECT& r) { return D3D11_BOX{(UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1}; }
 
+// Desktop Duplication returns the desktop in its native format: 8-bit normally, FP16 scRGB when HDR or
+// Auto Color Management (Advanced Color) is on, and possibly 10-bit.
+static DXGI_FORMAT TypelessFor(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+        case DXGI_FORMAT_R10G10B10A2_UNORM: return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+        default: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    }
+}
+static const char* FormatName(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return "FP16 scRGB (HDR / Auto Color Management)";
+        case DXGI_FORMAT_R10G10B10A2_UNORM: return "10-bit";
+        case DXGI_FORMAT_B8G8R8A8_UNORM: return "8-bit";
+        default: return "unsupported";
+    }
+}
+
 struct Renderer {
     // capture side (always the GPU the monitor is connected to)
     Com<ID3D11Device> cdev;
@@ -545,6 +568,8 @@ struct Renderer {
     Com<ID3D11Device> dev;
     Com<ID3D11DeviceContext> ctx;
     bool cross = false;
+    bool forceSame = false;  // advanced-colour capture only works on the monitor's GPU
+    DXGI_FORMAT capFmt = DXGI_FORMAT_B8G8R8A8_UNORM;  // format of the captured desktop (and of the overlay swap chain)
     Com<IDXGISwapChain1> sc;
     Com<IDCompositionDevice> dc;
     Com<IDCompositionTarget> tgt;
@@ -709,7 +734,7 @@ struct Renderer {
         }
         DXGI_ADAPTER_DESC1 procDesc = capDesc;
         if (procAd) procAd->GetDesc1(&procDesc);
-        cross = procAd && !SameLuid(procDesc.AdapterLuid, capDesc.AdapterLuid);
+        cross = procAd && !SameLuid(procDesc.AdapterLuid, capDesc.AdapterLuid) && !forceSame;
         g_cross = cross;
         swprintf(g_capGpuName, 128, L"%ls", capDesc.Description);
         swprintf(g_gpuName, 128, L"%ls", procDesc.Description);
@@ -756,7 +781,7 @@ struct Renderer {
         td.Height = h;
         td.MipLevels = 1;
         td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        td.Format = TypelessFor(capFmt);
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -764,10 +789,13 @@ struct Renderer {
         D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
         sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         sd.Texture2D.MipLevels = 1;
-        sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.Format = capFmt;
         if (FAILED(dev->CreateShaderResourceView(src[i].get(), &sd, srv[i][0].put()))) return false;
-        sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-        if (FAILED(dev->CreateShaderResourceView(src[i].get(), &sd, srv[i][1].put()))) srv[i][1].reset();
+        srv[i][1].reset();
+        if (capFmt == DXGI_FORMAT_B8G8R8A8_UNORM) {  // the sRGB view (linear-light option) only exists for 8-bit
+            sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            if (FAILED(dev->CreateShaderResourceView(src[i].get(), &sd, srv[i][1].put()))) srv[i][1].reset();
+        }
         return true;
     }
 
@@ -786,7 +814,7 @@ struct Renderer {
             DXGI_SWAP_CHAIN_DESC1 d{};
             d.Width = w;
             d.Height = h;
-            d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            d.Format = capFmt;
             d.SampleDesc.Count = 1;
             d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
             d.BufferCount = 2;
@@ -795,11 +823,18 @@ struct Renderer {
             d.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;  // moving tiles are transparent
             HRESULT hr = f2->CreateSwapChainForComposition(cdev.get(), &d, nullptr, sc.put());
             if (FAILED(hr)) { Log("Swap chain error 0x%08lx", hr); return false; }
+            if (capFmt == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                Com<IDXGISwapChain3> sc3;
+                if (SUCCEEDED(sc.as(sc3))) {
+                    HRESULT cs = sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);  // scRGB: linear, sRGB primaries
+                    if (FAILED(cs)) Log("SetColorSpace1(scRGB) failed 0x%08lx", cs);
+                }
+            }
             vis->SetContent(sc.get());
             tgt->SetRoot(vis.get());
             dc->Commit();
         } else {
-            HRESULT hr = sc->ResizeBuffers(2, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
+            HRESULT hr = sc->ResizeBuffers(2, w, h, capFmt, 0);
             if (FAILED(hr)) { Log("ResizeBuffers error 0x%08lx", hr); return false; }
         }
         // Render target: the back buffer directly on the same GPU; an intermediate texture on the processing GPU in cross mode
@@ -831,12 +866,15 @@ struct Renderer {
         Com<ID3D11RenderTargetView>* views = cross ? outRtv : rtv;
         D3D11_RENDER_TARGET_VIEW_DESC rd{};
         rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-        rd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        rd.Format = capFmt;
         if (FAILED(dev->CreateRenderTargetView(target.get(), &rd, views[0].put()))) return false;
-        rd.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-        if (FAILED(dev->CreateRenderTargetView(target.get(), &rd, views[1].put()))) {
-            Log("sRGB RTV not supported — linear mode will run in gamma space");
-            views[1].reset();
+        views[1].reset();
+        if (capFmt == DXGI_FORMAT_B8G8R8A8_UNORM) {
+            rd.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            if (FAILED(dev->CreateRenderTargetView(target.get(), &rd, views[1].put()))) {
+                Log("sRGB RTV not supported — linear mode will run in gamma space");
+                views[1].reset();
+            }
         }
         accFull = true;
         tw = (int)(w + TILE - 1) / TILE;
@@ -888,11 +926,25 @@ struct Renderer {
     }
 
     bool StartDuplication() {
-        if (IsHdr()) {
+        const bool hdrOn = IsHdr();
+        if (hdrOn && !GetCfg().hdr) {
             g_status = ST_HDR;
             return false;
         }
-        HRESULT hr = out1->DuplicateOutput(cdev.get(), dup.put());
+        HRESULT hr;
+        if (hdrOn) {
+            // HDR: the legacy call would hand out a tone-mapped copy; DuplicateOutput1 returns the real scRGB desktop
+            Com<IDXGIOutput5> o5;
+            if (FAILED(out1.as(o5))) {
+                Log("HDR capture needs IDXGIOutput5 (Windows 10 1709 or later)");
+                g_status = ST_HDR;
+                return false;
+            }
+            const DXGI_FORMAT want[] = {DXGI_FORMAT_R16G16B16A16_FLOAT};
+            hr = o5->DuplicateOutput1(cdev.get(), 0, 1, want, dup.put());
+        } else {
+            hr = out1->DuplicateOutput(cdev.get(), dup.put());
+        }
         if (FAILED(hr)) {
             static HRESULT last = 0;
             if (hr != last) Log("DuplicateOutput error 0x%08lx", hr);
@@ -902,11 +954,26 @@ struct Renderer {
         }
         DXGI_OUTDUPL_DESC dd{};
         dup->GetDesc(&dd);
-        if (dd.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
-            Log("Unexpected desktop format %d (HDR/10-bit?)", (int)dd.ModeDesc.Format);
+        const DXGI_FORMAT f = dd.ModeDesc.Format;
+        if (f != DXGI_FORMAT_B8G8R8A8_UNORM && f != DXGI_FORMAT_R10G10B10A2_UNORM && f != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            Log("Unsupported desktop format %d", (int)f);
             dup.reset();
-            g_status = ST_HDR;
+            g_status = ST_FORMAT;
             return false;
+        }
+        if (f != DXGI_FORMAT_B8G8R8A8_UNORM && cross) {
+            Log("Advanced-colour capture (%s) needs the monitor's GPU: ignoring the Processing GPU setting", FormatName(f));
+            dup.reset();
+            forceSame = true;
+            g_restart = true;
+            return false;
+        }
+        if (f != capFmt || !sc) {
+            Log("Desktop format: %s%s", FormatName(f), hdrOn ? " (HDR on)" : "");
+            ReleaseSized();
+            sc.reset();  // the overlay swap chain must use the same format as the capture
+            w = h = 0;
+            capFmt = f;
         }
         if (!EnsureSize(dd.ModeDesc.Width, dd.ModeDesc.Height)) {
             dup.reset();
@@ -1012,6 +1079,7 @@ struct Renderer {
         d.size[0] = (int)w - 1;
         d.size[1] = (int)h - 1;
         d.tile[0] = TILE;
+        d.tile[1] = capFmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 0;  // scRGB: no clamping
         ctx->UpdateSubresource(maskTex.get(), 0, nullptr, mask.data(), (UINT)tw, 0);
         lastMask = mask;
         D3D11_MAPPED_SUBRESOURCE m;
@@ -1340,7 +1408,8 @@ static const wchar_t* StatusText() {
         case ST_ACTIVE: return L"Active";
         case ST_DISABLED: return L"Off";
         case ST_FULLSCREEN: return L"Fullscreen application — paused";
-        case ST_HDR: return L"HDR is on — paused (SDR only)";
+        case ST_HDR: return L"HDR is on — paused (turn on Experimental HDR in Settings)";
+        case ST_FORMAT: return L"Unsupported desktop colour format — paused (see log)";
         case ST_WAITING: return L"Waiting for capture";
         case ST_ERROR: return L"Error — see OLEDTextFix.log";
         default: return L"Starting";
@@ -1568,6 +1637,7 @@ static void TrayBalloon(const wchar_t* title, const wchar_t* text) {
     Shell_NotifyIconW(NIM_MODIFY, &n);
 }
 
+static wchar_t g_autoNote[256] = L"";  // shown once after the first start (auto-picked preset)
 static bool g_updManual = false;  // the check was started from the menu: report "up to date" / errors too
 
 static void OnUpdateResult(int st) {
@@ -1668,7 +1738,7 @@ static void HandleTrayCommand(UINT id) {
 enum {
     IDC_ENABLED = 1001, IDC_COMPARE, IDC_LINEAR, IDC_CLEARTYPE, IDC_SUSPEND, IDC_AUTOSTART,
     IDC_MONITOR, IDC_PRESET, IDC_DELETE, IDC_NAME, IDC_SAVEAS, IDC_KERNEL,
-    IDC_SAVE, IDC_DEFAULTS, IDC_CLOSE, IDC_GPU, IDC_FPSCAP, IDC_OPAQUE, IDC_MOTION, IDC_SLIDER0 = 1100,
+    IDC_SAVE, IDC_DEFAULTS, IDC_CLOSE, IDC_GPU, IDC_FPSCAP, IDC_OPAQUE, IDC_MOTION, IDC_HDR, IDC_SLIDER0 = 1100,
 };
 
 static const int kSliders = 7;  // 0..5: RX RY GX GY BX BY, 6: strength
@@ -1679,7 +1749,7 @@ struct SettingsUI {
     HWND hdrGeneral, chkEnabled, chkCompare, chkLinear, chkCT, lblCT, chkSuspend, chkAutostart, lblMon, cmbMon;
     HWND hdrPreset, cmbPreset, btnDelete, edtName, btnSaveAs;
     HWND hdrSub, lblSl[kSliders], sl[kSliders], val[kSliders], lblKernel, cmbKernel;
-    HWND hdrPerf, lblGpu, cmbGpu, lblFps, cmbFps, chkOpaque, chkMotion;
+    HWND hdrPerf, lblGpu, cmbGpu, lblFps, cmbFps, chkOpaque, chkMotion, chkHdr;
     HWND btnSave, btnDefaults, btnClose, lblStatus;
     std::vector<GpuInfo> gpus;
     HFONT font = nullptr, fontBold = nullptr;
@@ -1757,6 +1827,7 @@ static void SyncControls() {
     SendMessageW(g_ui.cmbFps, CB_SETCURSEL, fsel, 0);
     chk(g_ui.chkMotion, c.motionBypass);
     chk(g_ui.chkOpaque, c.overlayAlpha >= 255);
+    chk(g_ui.chkHdr, c.hdr);
     FillPresetCombo();
     UpdateClearTypeLabel();
     g_ui.syncing = false;
@@ -1833,7 +1904,8 @@ static void Layout() {
     for (HWND cb : {g_ui.cmbMon, g_ui.cmbGpu, g_ui.cmbPreset})
         SendMessageW(cb, CB_SETDROPPEDWIDTH, S(520), 0);
     Place(g_ui.chkMotion, x, y, w, rh); y += rh;
-    Place(g_ui.chkOpaque, x, y, w, rh); y += rh + S(10);
+    Place(g_ui.chkOpaque, x, y, w, rh); y += rh;
+    Place(g_ui.chkHdr, x, y, w, rh); y += rh + S(10);
 
     Place(g_ui.btnSave, x, y, S(110), S(28));
     Place(g_ui.btnDefaults, x + S(118), y, S(150), S(28));
@@ -1844,7 +1916,7 @@ static void Layout() {
     Place(g_ui.pattern, px, 0, std::max(10, (int)rc.right - px), rc.bottom);
 }
 
-static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 911;
+static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 935;
 
 static void ResizeForDpi() {
     RECT r{0, 0, S(kClientW), S(kClientH)};
@@ -1901,6 +1973,7 @@ static void CreateControls() {
     for (int i = 0; i < kFpsCapCount; i++) SendMessageW(g_ui.cmbFps, CB_ADDSTRING, 0, (LPARAM)kFpsCapNames[i]);
     g_ui.chkMotion = Mk(L"BUTTON", L"Show moving regions without latency (recommended)", BS_AUTOCHECKBOX | WS_TABSTOP, IDC_MOTION);
     g_ui.chkOpaque = Mk(L"BUTTON", L"Fully opaque overlay (sharper, recommended)", BS_AUTOCHECKBOX | WS_TABSTOP, IDC_OPAQUE);
+    g_ui.chkHdr = Mk(L"BUTTON", L"Experimental: process HDR desktops (restarts capture)", BS_AUTOCHECKBOX | WS_TABSTOP, IDC_HDR);
 
     g_ui.btnSave = Mk(L"BUTTON", L"Save", BS_PUSHBUTTON | WS_TABSTOP, IDC_SAVE);
     g_ui.btnDefaults = Mk(L"BUTTON", L"Restore defaults", BS_PUSHBUTTON | WS_TABSTOP, IDC_DEFAULTS);
@@ -2077,6 +2150,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                     }
                     break;
                 case IDC_MOTION: EditCfg([&](Config& c) { c.motionBypass = checked(g_ui.chkMotion); }); Changed(); break;
+                case IDC_HDR: EditCfg([&](Config& c) { c.hdr = checked(g_ui.chkHdr); }); g_restart = true; break;
                 case IDC_OPAQUE: {
                     int a = checked(g_ui.chkOpaque) ? 255 : 254;
                     EditCfg([&](Config& c) { c.overlayAlpha = a; });
@@ -2280,6 +2354,12 @@ static LRESULT CALLBACK MsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_TIMER: {
+            if (wp == 3) {  // one-time note about the auto-picked preset
+                KillTimer(g_msgWnd, 3);
+                if (g_autoNote[0]) TrayBalloon(L"OLEDTextFix preset", g_autoNote);
+                g_autoNote[0] = 0;
+                return 0;
+            }
             if (wp == 2) {  // update check: 20 s after start, then every 24 h
                 SetTimer(g_msgWnd, 2, 24 * 60 * 60 * 1000, nullptr);
                 if (GetCfg().updateCheck) StartUpdateCheck();
@@ -2370,7 +2450,11 @@ static void AutoPickPreset() {
     else if (w == 5120 && h == 1440)
         name = L"49\" 5120x1440 144/240 Hz QD-OLED (Gen 2, 2023)";
     Log("Monitor: %ls, %dx%d, %d Hz, %d mm wide -> preset: %ls", mfg, w, h, hz, widthMm, name ? name : L"(default)");
-    if (name) ApplyPreset(FindPreset(name));
+    if (name) {
+        ApplyPreset(FindPreset(name));
+        if (!lg)  // WOLED and QD-OLED can't be told apart by size and refresh rate on other brands
+            swprintf(g_autoNote, 256, L"Auto-selected preset: %ls. If your monitor is WOLED (it has a white subpixel), pick a WOLED preset in Settings.", name);
+    }
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
@@ -2484,6 +2568,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     RegisterHotKey(g_msgWnd, HK_CAL, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
     SetTimer(g_msgWnd, 1, 250, nullptr);
     SetTimer(g_msgWnd, 2, 20000, nullptr);
+    if (g_autoNote[0]) SetTimer(g_msgWnd, 3, 8000, nullptr);
 
     HANDLE th = CreateThread(nullptr, 0, RenderThread, nullptr, 0, nullptr);
 
