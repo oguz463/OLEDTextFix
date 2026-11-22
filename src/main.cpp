@@ -123,7 +123,6 @@ struct Config {
     wchar_t preset[64] = L"27\" 1440p 240/280 Hz QD-OLED";
     wchar_t gpu[128] = L"";  // empty = the GPU the monitor is connected to
     int fpsCap = 0;          // 0 = unlimited
-    int skipStatic = 1;      // don't process frames that did not really change
     int motionBypass = 1;    // show moving regions directly (no added latency)
     int motionFrames = 3;    // this many changed frames...
     int motionWindowMs = 120;  // ...within this window count as "motion"
@@ -261,7 +260,6 @@ static void LoadConfig() {
     GetPrivateProfileStringW(L"General", L"Preset", c.preset, c.preset, 64, g_iniPath);
     GetPrivateProfileStringW(L"Performance", L"Gpu", c.gpu, c.gpu, 128, g_iniPath);
     c.fpsCap = IniInt(L"Performance", L"FpsCap", c.fpsCap);
-    c.skipStatic = IniInt(L"Performance", L"SkipStaticFrames", c.skipStatic);
     c.motionBypass = IniInt(L"Performance", L"MotionBypass", c.motionBypass);
     c.motionFrames = std::max(2, IniInt(L"Performance", L"MotionFrames", c.motionFrames));
     c.motionWindowMs = std::max(30, IniInt(L"Performance", L"MotionWindowMs", c.motionWindowMs));
@@ -289,7 +287,6 @@ static void SaveConfig() {
     WritePrivateProfileStringW(L"General", L"Preset", c.preset, g_iniPath);
     WritePrivateProfileStringW(L"Performance", L"Gpu", c.gpu, g_iniPath);
     IniPutI(L"Performance", L"FpsCap", c.fpsCap);
-    IniPutI(L"Performance", L"SkipStaticFrames", c.skipStatic);
     IniPutI(L"Performance", L"MotionBypass", c.motionBypass);
     IniPutI(L"Performance", L"MotionFrames", c.motionFrames);
     IniPutI(L"Performance", L"MotionWindowMs", c.motionWindowMs);
@@ -499,21 +496,6 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target {
 }
 )HLSL";
 
-// Finds whether two frames differ inside a given rectangle
-static const char kDiffShader[] = R"HLSL(
-Texture2D<float4> a : register(t0);
-Texture2D<float4> b : register(t1);
-RWByteAddressBuffer flag : register(u0);
-cbuffer R : register(b0) { int4 rect; };
-
-[numthreads(16, 16, 1)]
-void CSMain(uint3 id : SV_DispatchThreadID) {
-    if ((int)id.x >= rect.z || (int)id.y >= rect.w) return;
-    int3 p = int3(rect.x + (int)id.x, rect.y + (int)id.y, 0);
-    if (any(a.Load(p) != b.Load(p))) flag.Store(0, 1u);
-}
-)HLSL";
-
 // ---------------------------------------------------------------- GPU list
 
 struct GpuInfo {
@@ -542,7 +524,7 @@ static std::vector<GpuInfo> EnumGpus() {
 
 typedef HRESULT(WINAPI* PFN_DCompCreate)(IDXGIDevice*, REFIID, void**);
 
-static std::atomic<int> g_skipFps{0}, g_ddaFps{0};
+static std::atomic<int> g_ddaFps{0};
 static std::atomic<bool> g_cross{false};
 static std::atomic<int> g_motionTiles{0};
 static wchar_t g_capGpuName[128] = L"?";
@@ -574,13 +556,8 @@ struct Renderer {
     Com<ID3D11VertexShader> vs;
     Com<ID3D11PixelShader> ps;
     Com<ID3D11Buffer> cb;
-    // change detection
-    Com<ID3D11ComputeShader> cs;
-    Com<ID3D11Buffer> flagBuf, flagStage, cbDiff;
-    Com<ID3D11UnorderedAccessView> flagUav;
     UINT w = 0, h = 0;
     bool haveFrame = false;
-    LONGLONG lastRealChange = 0;  // QPC time of the last frame that really changed (same-GPU compare is skipped while this is recent)
     std::vector<uint8_t> meta;
     std::vector<RECT> rects;
     // cross-adapter mode: the result drawn on the processing GPU is moved to the display GPU via the CPU;
@@ -646,11 +623,6 @@ struct Renderer {
         cb.reset();
         ps.reset();
         vs.reset();
-        cs.reset();
-        flagUav.reset();
-        flagBuf.reset();
-        flagStage.reset();
-        cbDiff.reset();
         out1.reset();
         if (ctx) { ctx->ClearState(); ctx->Flush(); }
         if (cctx) { cctx->ClearState(); cctx->Flush(); }
@@ -674,13 +646,11 @@ struct Renderer {
             if (FAILED(hr)) Log("%s compile error: %s", entry, err ? (const char*)err->GetBufferPointer() : "?");
             return SUCCEEDED(hr);
         };
-        Com<ID3DBlob> vsb, psb, csb;
+        Com<ID3DBlob> vsb, psb;
         if (!compile(kShader, sizeof(kShader) - 1, "VSMain", "vs_5_0", vsb)) return false;
         if (!compile(kShader, sizeof(kShader) - 1, "PSMain", "ps_5_0", psb)) return false;
-        if (!compile(kDiffShader, sizeof(kDiffShader) - 1, "CSMain", "cs_5_0", csb)) return false;
         if (FAILED(dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, vs.put()))) return false;
         if (FAILED(dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, ps.put()))) return false;
-        if (FAILED(dev->CreateComputeShader(csb->GetBufferPointer(), csb->GetBufferSize(), nullptr, cs.put()))) return false;
         return true;
     }
 
@@ -765,26 +735,6 @@ struct Renderer {
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         if (FAILED(dev->CreateBuffer(&bd, nullptr, cb.put()))) return false;
-        bd.ByteWidth = 16;
-        if (FAILED(dev->CreateBuffer(&bd, nullptr, cbDiff.put()))) return false;
-
-        D3D11_BUFFER_DESC fb{};
-        fb.ByteWidth = 16;
-        fb.Usage = D3D11_USAGE_DEFAULT;
-        fb.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-        fb.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-        if (FAILED(dev->CreateBuffer(&fb, nullptr, flagBuf.put()))) return false;
-        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-        ud.Format = DXGI_FORMAT_R32_TYPELESS;
-        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-        ud.Buffer.NumElements = 4;
-        ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
-        if (FAILED(dev->CreateUnorderedAccessView(flagBuf.get(), &ud, flagUav.put()))) return false;
-        fb.Usage = D3D11_USAGE_STAGING;
-        fb.BindFlags = 0;
-        fb.MiscFlags = 0;
-        fb.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        if (FAILED(dev->CreateBuffer(&fb, nullptr, flagStage.put()))) return false;
 
         // DirectComposition: always on the monitor's GPU (cross-adapter presentation flickers)
         static HMODULE dcompDll = LoadLibraryW(L"dcomp.dll");
@@ -911,7 +861,6 @@ struct Renderer {
             if (FAILED(dev->CreateShaderResourceView(maskTex.get(), nullptr, maskSrv.put()))) return false;
         }
         if (!MakeSrc(0)) return false;
-        if (!cross && !MakeSrc(1)) return false;  // same GPU: two textures to compare previous/current frame
         cur = 0;
         if (cross) {
             D3D11_TEXTURE2D_DESC td{};
@@ -1005,56 +954,19 @@ struct Renderer {
         if (rects.size() > 48) rects.assign(1, u);  // too fragmented: use one bounding box
     }
 
-    // Same-GPU path: copy the new frame into the spare texture and check whether it really changed
-    bool IngestSameGpu(ID3D11Texture2D* frame, bool skipStatic) {
-        int nxt = 1 - cur;
-        ctx->CopyResource(src[nxt].get(), frame);
-        bool changed = true;
-        // The compare needs a blocking read-back of a flag, which stalls the pipeline. Only do it when the
-        // content has been quiet: while something is moving (dragging a window or cards) nearly every frame
-        // really changes, so the compare would only add latency.
-        LARGE_INTEGER qn, qf;
-        QueryPerformanceCounter(&qn);
-        QueryPerformanceFrequency(&qf);
-        bool quiet = qn.QuadPart - lastRealChange > qf.QuadPart * 150 / 1000;
-        if (haveFrame && skipStatic && quiet && !rects.empty()) {
-            UINT zero[4] = {0, 0, 0, 0};
-            ctx->ClearUnorderedAccessViewUint(flagUav.get(), zero);
-            ID3D11ShaderResourceView* views[2] = {srv[nxt][0].get(), srv[cur][0].get()};
-            ID3D11UnorderedAccessView* uav = flagUav.get();
-            ID3D11Buffer* b = cbDiff.get();
-            ctx->CSSetShader(cs.get(), nullptr, 0);
-            ctx->CSSetShaderResources(0, 2, views);
-            ctx->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-            ctx->CSSetConstantBuffers(0, 1, &b);
-            for (const RECT& r : rects) {
-                D3D11_MAPPED_SUBRESOURCE m;
-                if (FAILED(ctx->Map(cbDiff.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) continue;
-                int rr[4] = {(int)r.left, (int)r.top, (int)(r.right - r.left), (int)(r.bottom - r.top)};
-                memcpy(m.pData, rr, sizeof rr);
-                ctx->Unmap(cbDiff.get(), 0);
-                ctx->Dispatch((rr[2] + 15) / 16, (rr[3] + 15) / 16, 1);
-            }
-            ID3D11ShaderResourceView* nullv[2] = {};
-            ID3D11UnorderedAccessView* nullu = nullptr;
-            ctx->CSSetShaderResources(0, 2, nullv);
-            ctx->CSSetUnorderedAccessViews(0, 1, &nullu, nullptr);
-            ctx->CopyResource(flagStage.get(), flagBuf.get());
-            D3D11_MAPPED_SUBRESOURCE m;
-            if (SUCCEEDED(ctx->Map(flagStage.get(), 0, D3D11_MAP_READ, 0, &m))) {
-                changed = ((const UINT*)m.pData)[0] != 0;
-                ctx->Unmap(flagStage.get(), 0);
-            }
+    // Same-GPU path: copy only the changed regions of the new frame into our persistent copy of the desktop
+    // (the first frame after a (re)start reports the whole screen as one region)
+    bool IngestSameGpu(ID3D11Texture2D* frame) {
+        for (const RECT& r : rects) {
+            D3D11_BOX box = BoxOf(r);
+            ctx->CopySubresourceRegion(src[0].get(), 0, r.left, r.top, 0, frame, 0, &box);
         }
-        if (changed) {
-            cur = nxt;
-            lastRealChange = qn.QuadPart;
-        }
-        return changed;
+        cur = 0;
+        return true;
     }
 
     // Cross-GPU path: move changed regions to the processing GPU via the CPU
-    bool IngestCross(ID3D11Texture2D* frame, bool skipStatic) {
+    bool IngestCross(ID3D11Texture2D* frame) {
         for (const RECT& r : rects) {
             D3D11_BOX box = BoxOf(r);
             cctx->CopySubresourceRegion(stage.get(), 0, r.left, r.top, 0, frame, 0, &box);
@@ -1064,19 +976,14 @@ struct Renderer {
         bool any = false;
         const size_t pitch = (size_t)w * 4;
         for (const RECT& r : rects) {
-            bool diff = !haveFrame || !skipStatic;
             size_t bytes = (size_t)(r.right - r.left) * 4;
             for (LONG y = r.top; y < r.bottom; y++) {
-                const uint8_t* s = (const uint8_t*)m.pData + (size_t)y * m.RowPitch + (size_t)r.left * 4;
-                uint8_t* d = shadow.data() + (size_t)y * pitch + (size_t)r.left * 4;
-                if (!diff && memcmp(s, d, bytes) != 0) diff = true;
-                if (diff) memcpy(d, s, bytes);
+                const uint8_t* sp = (const uint8_t*)m.pData + (size_t)y * m.RowPitch + (size_t)r.left * 4;
+                memcpy(shadow.data() + (size_t)y * pitch + (size_t)r.left * 4, sp, bytes);
             }
-            if (diff) {
-                D3D11_BOX box = BoxOf(r);
-                ctx->UpdateSubresource(src[0].get(), 0, &box, shadow.data() + (size_t)r.top * pitch + (size_t)r.left * 4, (UINT)pitch, 0);
-                any = true;
-            }
+            D3D11_BOX box = BoxOf(r);
+            ctx->UpdateSubresource(src[0].get(), 0, &box, shadow.data() + (size_t)r.top * pitch + (size_t)r.left * 4, (UINT)pitch, 0);
+            any = true;
         }
         cctx->Unmap(stage.get(), 0);
         cur = 0;
@@ -1208,7 +1115,7 @@ struct Renderer {
         LARGE_INTEGER freq, lastRender{}, statT0, now;
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&statT0);
-        int frames = 0, skipped = 0, dda = 0;
+        int frames = 0, dda = 0;
         bool pending = false;
         int motionTiles = 0;
         while (g_running) {
@@ -1282,7 +1189,7 @@ struct Renderer {
                     GatherRects(fi);
                     Com<ID3D11Texture2D> t;
                     if (!rects.empty() && SUCCEEDED(res.as(t))) {
-                        bool changed = cross ? IngestCross(t.get(), c.skipStatic != 0) : IngestSameGpu(t.get(), c.skipStatic != 0);
+                        bool changed = cross ? IngestCross(t.get()) : IngestSameGpu(t.get());
                         haveFrame = true;
                         if (changed) {
                             pending = true;
@@ -1290,7 +1197,6 @@ struct Renderer {
                             MarkTiles(now.QuadPart, freq.QuadPart, c);
                             if (cross) acc.insert(acc.end(), rects.begin(), rects.end());
                         }
-                        else skipped++;
                     }
                 }
                 res.reset();
@@ -1320,9 +1226,8 @@ struct Renderer {
             QueryPerformanceCounter(&now);
             if (now.QuadPart - statT0.QuadPart >= freq.QuadPart) {
                 g_fps = frames;
-                g_skipFps = skipped;
                 g_ddaFps = dda;
-                frames = skipped = dda = 0;
+                frames = dda = 0;
                 statT0 = now;
             }
         }
@@ -1763,7 +1668,7 @@ static void HandleTrayCommand(UINT id) {
 enum {
     IDC_ENABLED = 1001, IDC_COMPARE, IDC_LINEAR, IDC_CLEARTYPE, IDC_SUSPEND, IDC_AUTOSTART,
     IDC_MONITOR, IDC_PRESET, IDC_DELETE, IDC_NAME, IDC_SAVEAS, IDC_KERNEL,
-    IDC_SAVE, IDC_DEFAULTS, IDC_CLOSE, IDC_GPU, IDC_FPSCAP, IDC_SKIPSTATIC, IDC_OPAQUE, IDC_MOTION, IDC_SLIDER0 = 1100,
+    IDC_SAVE, IDC_DEFAULTS, IDC_CLOSE, IDC_GPU, IDC_FPSCAP, IDC_OPAQUE, IDC_MOTION, IDC_SLIDER0 = 1100,
 };
 
 static const int kSliders = 7;  // 0..5: RX RY GX GY BX BY, 6: strength
@@ -1774,7 +1679,7 @@ struct SettingsUI {
     HWND hdrGeneral, chkEnabled, chkCompare, chkLinear, chkCT, lblCT, chkSuspend, chkAutostart, lblMon, cmbMon;
     HWND hdrPreset, cmbPreset, btnDelete, edtName, btnSaveAs;
     HWND hdrSub, lblSl[kSliders], sl[kSliders], val[kSliders], lblKernel, cmbKernel;
-    HWND hdrPerf, lblGpu, cmbGpu, lblFps, cmbFps, chkSkip, chkOpaque, chkMotion;
+    HWND hdrPerf, lblGpu, cmbGpu, lblFps, cmbFps, chkOpaque, chkMotion;
     HWND btnSave, btnDefaults, btnClose, lblStatus;
     std::vector<GpuInfo> gpus;
     HFONT font = nullptr, fontBold = nullptr;
@@ -1850,7 +1755,6 @@ static void SyncControls() {
     for (int i = 0; i < kFpsCapCount; i++)
         if (kFpsCaps[i] == c.fpsCap) fsel = i;
     SendMessageW(g_ui.cmbFps, CB_SETCURSEL, fsel, 0);
-    chk(g_ui.chkSkip, c.skipStatic);
     chk(g_ui.chkMotion, c.motionBypass);
     chk(g_ui.chkOpaque, c.overlayAlpha >= 255);
     FillPresetCombo();
@@ -1928,7 +1832,6 @@ static void Layout() {
     // let long entries (monitor/GPU names) show in full when a list is open
     for (HWND cb : {g_ui.cmbMon, g_ui.cmbGpu, g_ui.cmbPreset})
         SendMessageW(cb, CB_SETDROPPEDWIDTH, S(520), 0);
-    Place(g_ui.chkSkip, x, y, w, rh); y += rh;
     Place(g_ui.chkMotion, x, y, w, rh); y += rh;
     Place(g_ui.chkOpaque, x, y, w, rh); y += rh + S(10);
 
@@ -1941,7 +1844,7 @@ static void Layout() {
     Place(g_ui.pattern, px, 0, std::max(10, (int)rc.right - px), rc.bottom);
 }
 
-static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 935;
+static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 911;
 
 static void ResizeForDpi() {
     RECT r{0, 0, S(kClientW), S(kClientH)};
@@ -1996,7 +1899,6 @@ static void CreateControls() {
     g_ui.lblFps = Mk(L"STATIC", L"Frame cap", 0, 0);
     g_ui.cmbFps = Mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, IDC_FPSCAP);
     for (int i = 0; i < kFpsCapCount; i++) SendMessageW(g_ui.cmbFps, CB_ADDSTRING, 0, (LPARAM)kFpsCapNames[i]);
-    g_ui.chkSkip = Mk(L"BUTTON", L"Skip unchanged frames (recommended)", BS_AUTOCHECKBOX | WS_TABSTOP, IDC_SKIPSTATIC);
     g_ui.chkMotion = Mk(L"BUTTON", L"Show moving regions without latency (recommended)", BS_AUTOCHECKBOX | WS_TABSTOP, IDC_MOTION);
     g_ui.chkOpaque = Mk(L"BUTTON", L"Fully opaque overlay (sharper, recommended)", BS_AUTOCHECKBOX | WS_TABSTOP, IDC_OPAQUE);
 
@@ -2058,11 +1960,11 @@ static void UpdateStatusLabel() {
     if (!g_ui.wnd) return;
     wchar_t b[512];
     if (g_cross)
-        swprintf(b, 512, L"Status: %ls\nProcessed %d · skipped %d · captured %d fps\nCapture GPU: %ls\nProcessing GPU: %ls (cross-adapter)", StatusText(),
-                 g_fps.load(), g_skipFps.load(), g_ddaFps.load(), g_capGpuName, g_gpuName);
+        swprintf(b, 512, L"Status: %ls\nProcessed %d · captured %d fps\nCapture GPU: %ls\nProcessing GPU: %ls (cross-adapter)", StatusText(),
+                 g_fps.load(), g_ddaFps.load(), g_capGpuName, g_gpuName);
     else
-        swprintf(b, 512, L"Status: %ls\nProcessed %d · skipped %d · captured %d fps · moving %d tiles\nGPU: %ls", StatusText(),
-                 g_fps.load(), g_skipFps.load(), g_ddaFps.load(), g_motionTiles.load(), g_gpuName);
+        swprintf(b, 512, L"Status: %ls\nProcessed %d · captured %d fps · moving %d tiles\nGPU: %ls", StatusText(),
+                 g_fps.load(), g_ddaFps.load(), g_motionTiles.load(), g_gpuName);
     SetWindowTextW(g_ui.lblStatus, b);
 }
 
@@ -2174,7 +2076,6 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                         EditCfg([&](Config& c) { c.fpsCap = kFpsCaps[std::max(0, std::min(kFpsCapCount - 1, sel))]; });
                     }
                     break;
-                case IDC_SKIPSTATIC: EditCfg([&](Config& c) { c.skipStatic = checked(g_ui.chkSkip); }); break;
                 case IDC_MOTION: EditCfg([&](Config& c) { c.motionBypass = checked(g_ui.chkMotion); }); Changed(); break;
                 case IDC_OPAQUE: {
                     int a = checked(g_ui.chkOpaque) ? 255 : 254;
@@ -2190,7 +2091,6 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                         Config d;
                         c.linear = d.linear;
                         c.overlayAlpha = d.overlayAlpha;
-                        c.skipStatic = d.skipStatic;
                         c.motionBypass = d.motionBypass;
                         c.fpsCap = d.fpsCap;
                     });

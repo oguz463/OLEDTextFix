@@ -197,7 +197,6 @@ Options at the bottom of the Settings window:
   selected (experimental); capture and presentation still happen on the monitor's GPU and changed
   regions are copied through the CPU, which can add latency while scrolling.
 - **Frame cap**: limits processed frames per second while something is changing.
-- **Skip unchanged frames**: only processes frames whose content really changed.
 - **Show moving regions without latency** (default on): 64×64 tiles that keep changing (scrolling,
   video, dragged windows) are left transparent, so the real desktop shows through with no added
   delay; they are corrected again once still (250 ms). Tunable in the INI file with
@@ -205,10 +204,11 @@ Options at the bottom of the Settings window:
 - **Fully opaque overlay** (default on): lets Windows show the overlay pixel for pixel. Turn it off
   if an application stops updating underneath or the screen flickers.
 
-The status line shows **processed / skipped / captured** frames per second and the GPU in use.
+The status line shows **processed / captured** frames per second and the GPU in use.
 
 **Higher idle power?** Watch the status line with the screen completely still. If the captured
-count is high, "Skip unchanged frames" should keep the processed count near 0. If all counts are 0
+count is high while nothing visibly changes, something on the desktop (an animation, a blinking
+cursor, a video) keeps updating the screen; every update is processed. If all counts are 0
 and power is still higher, the GPU may be keeping its memory clock up because of the fullscreen
 overlay; try toggling "Fully opaque overlay" or another Processing GPU, and report the result with
 `OLEDTextFix.log`.
