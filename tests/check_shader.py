@@ -8,7 +8,7 @@ if not m:
     sys.exit('kShader not found')
 hlsl = m.group(1)
 ok = True
-for entry, stage in (('VSMain', 'vert'), ('PSMain', 'frag'), ('PSCancel', 'frag')):
+for entry, stage in (('VSMain', 'vert'), ('PSMain', 'frag'), ('PSCancel', 'frag'), ('PSDiff', 'frag')):
     with tempfile.NamedTemporaryFile('w', suffix='.hlsl', delete=False) as f:
         f.write(hlsl)
     r = subprocess.run(['glslangValidator', '-V', '-D', '-S', stage, '-e', entry, '-o', os.devnull, f.name], capture_output=True, text=True)

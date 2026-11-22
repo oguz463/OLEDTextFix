@@ -237,6 +237,10 @@ Options at the bottom of the Settings window:
   video, dragged windows) are left transparent, so the real desktop shows through with no added
   delay; they are corrected again once still (250 ms). Tunable in the INI file with
   `MotionFrames`, `MotionWindowMs` and `MotionSettleMs`.
+- **Identical frames are skipped** (since 1.2.1): Windows sometimes reports the whole screen as changed
+  although no pixel is different (for example after the overlay itself was presented). Such updates are
+  compared on the GPU and ignored, so a still desktop costs no GPU time and is no longer treated as
+  "moving". `SkipUnchanged=0` in the `[Performance]` section of the INI file turns this off.
 - **Fully opaque overlay** (default on): lets Windows show the overlay pixel for pixel. Turn it off
   if an application stops updating underneath or the screen flickers.
 

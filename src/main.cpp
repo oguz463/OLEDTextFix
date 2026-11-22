@@ -109,6 +109,10 @@ static int NormalizeKernel(int k) {
     return k;
 }
 
+#ifndef OTF_DIAG_DEFAULT
+#define OTF_DIAG_DEFAULT 0  // the diagnostic build (build.sh diag) turns the timing log on by default
+#endif
+
 struct Config {
     int monitor = -1;  // -1 = automatic (Samsung first, then primary)
     // Physical position of each channel's subpixel relative to the pixel centre (in pixels)
@@ -124,12 +128,14 @@ struct Config {
     wchar_t preset[64] = L"27\" 1440p 240/280 Hz QD-OLED";
     wchar_t gpu[128] = L"";  // empty = the GPU the monitor is connected to
     int fpsCap = 0;          // 0 = unlimited
+    int skipUnchanged = 1;   // do not redraw when the desktop reports a change but the pixels are identical
     int motionBypass = 1;    // show moving regions directly (no added latency)
     int motionFrames = 3;    // this many changed frames...
     int motionWindowMs = 120;  // ...within this window count as "motion"
     int motionSettleMs = 250;  // re-apply the correction this long after motion stops
     int updateCheck = 1;       // look for a newer release on GitHub and install it
     int hdr = 0;               // experimental: process HDR (scRGB) desktops instead of pausing
+    int diag = OTF_DIAG_DEFAULT;  // write latency / timing statistics to OLEDTextFix.log once per second
     // Experimental (WOLED only): remove the colour ClearType adds to grey text before the subpixel correction.
     int ctCancel = 0;          // 1 = on (still needs a WOLED preset and 8-bit capture)
     bool woled = false;        // the active preset is a WOLED layout (set by ApplyPreset / LoadConfig)
@@ -269,9 +275,11 @@ static void LoadConfig() {
     c.overlayAlpha = IniInt(L"General", L"OverlayAlpha", c.overlayAlpha);
     c.updateCheck = IniInt(L"General", L"CheckForUpdates", c.updateCheck);
     c.hdr = IniInt(L"General", L"ExperimentalHDR", c.hdr);
+    c.diag = IniInt(L"Debug", L"Diagnostics", c.diag);
     GetPrivateProfileStringW(L"General", L"Preset", c.preset, c.preset, 64, g_iniPath);
     GetPrivateProfileStringW(L"Performance", L"Gpu", c.gpu, c.gpu, 128, g_iniPath);
     c.fpsCap = IniInt(L"Performance", L"FpsCap", c.fpsCap);
+    c.skipUnchanged = IniInt(L"Performance", L"SkipUnchanged", c.skipUnchanged) ? 1 : 0;
     c.motionBypass = IniInt(L"Performance", L"MotionBypass", c.motionBypass);
     c.motionFrames = std::max(2, IniInt(L"Performance", L"MotionFrames", c.motionFrames));
     c.motionWindowMs = std::max(30, IniInt(L"Performance", L"MotionWindowMs", c.motionWindowMs));
@@ -519,6 +527,17 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target {
     return float4(saturate(float3(r, g, b)), 1.0);
 }
 
+// Change detector: draws a pixel only where the new capture differs from the stored one. An occlusion predicate
+// over this draw tells whether anything changed at all (the desktop often reports "everything changed" for frames
+// that are pixel-identical, e.g. when only our own overlay was presented).
+Texture2D<float4> diffNew : register(t2);
+Texture2D<float4> diffOld : register(t3);
+float4 PSDiff(float4 pos : SV_Position) : SV_Target {
+    int3 p = int3(int2(pos.xy), 0);
+    if (all(diffNew.Load(p) == diffOld.Load(p))) discard;
+    return float4(1, 1, 1, 1);
+}
+
 // Optional first pass (WOLED, experimental): removes the colour ClearType adds to grey/white/black text so that
 // the channel shifts of PSMain act on a (nearly) greyscale-antialiased image. A pixel is only touched when all
 // three gates agree it is ClearType text: the colour cancels along the row, the window has text-like luma
@@ -639,7 +658,24 @@ static const char* FormatName(DXGI_FORMAT f) {
     }
 }
 
+// Timing statistics for the diagnostic log (all values in milliseconds)
+struct DiagStat {
+    double sum = 0, mx = 0;
+    int n = 0;
+    void add(double v) { sum += v; if (v > mx) mx = v; n++; }
+    double avg() const { return n ? sum / n : 0; }
+    void reset() { *this = DiagStat(); }
+};
+
 struct Renderer {
+    // diagnostics (see Config::diag)
+    DiagStat dAcq, dIngest, dRender, dPresent, dGpu, dLat, dArea;
+    int dBuckets[4] = {0, 0, 0, 0}, dMaxRects = 0, dMaxTiles = 0, dTimeouts = 0, dSlowLogs = 0;
+    double dLastPresentMs = 0;
+    Com<ID3D11Query> dQDisjoint[3], dQStart[3], dQEnd[3];
+    int dQWrite = 0, dQPending = 0;
+    bool dQReady[3] = {false, false, false};
+    bool dHeader = false;
     // capture side (always the GPU the monitor is connected to)
     Com<ID3D11Device> cdev;
     Com<ID3D11DeviceContext> cctx;
@@ -672,6 +708,15 @@ struct Renderer {
     Com<ID3D11RenderTargetView> ctRtv;
     bool ctFailed = false;   // creating the pre-pass resources failed: stay off until the size or device changes
     bool lastCtOn = false;   // the last drawn frame used the pre-pass (widens the cross-adapter copy margin)
+    // change detector for same-GPU capture (see PSDiff); resources are created on first use
+    Com<ID3D11PixelShader> psDiff;
+    Com<ID3D11Texture2D> cmpTex, cmpRt;
+    Com<ID3D11ShaderResourceView> cmpSrv;
+    Com<ID3D11RenderTargetView> cmpRtv;
+    Com<ID3D11RasterizerState> rsScissor;
+    Com<ID3D11Query> qDiff;
+    bool diffFailed = false;
+    int dSame = 0;           // diagnostics: desktop updates whose pixels were identical
     UINT w = 0, h = 0;
     bool haveFrame = false;
     std::vector<uint8_t> meta;
@@ -725,6 +770,11 @@ struct Renderer {
         ctSrv.reset();
         ctTex.reset();
         ctFailed = false;
+        cmpRtv.reset();
+        cmpSrv.reset();
+        cmpTex.reset();
+        cmpRt.reset();
+        diffFailed = false;
         tw = th = 0;
     }
 
@@ -743,9 +793,14 @@ struct Renderer {
         cb.reset();
         cbCt.reset();
         psCt.reset();
+        psDiff.reset();
+        rsScissor.reset();
+        qDiff.reset();
         ps.reset();
         vs.reset();
         out1.reset();
+        for (int k = 0; k < 3; k++) { dQDisjoint[k].reset(); dQStart[k].reset(); dQEnd[k].reset(); dQReady[k] = false; }
+        dQPending = -1;
         if (ctx) { ctx->ClearState(); ctx->Flush(); }
         if (cctx) { cctx->ClearState(); cctx->Flush(); }
         ctx.reset();
@@ -780,6 +835,12 @@ struct Renderer {
             ;
         else
             psCt.reset();
+        Com<ID3DBlob> dfb;
+        if (compile(kShader, sizeof(kShader) - 1, "PSDiff", "ps_5_0", dfb) &&
+            SUCCEEDED(dev->CreatePixelShader(dfb->GetBufferPointer(), dfb->GetBufferSize(), nullptr, psDiff.put())))
+            ;
+        else
+            psDiff.reset();
         return true;
     }
 
@@ -1127,9 +1188,109 @@ struct Renderer {
         if (rects.size() > 48) rects.assign(1, u);  // too fragmented: use one bounding box
     }
 
+    bool EnsureDiff() {
+        if (diffFailed) return false;
+        if (cmpTex && qDiff && rsScissor) return true;
+        if (!psDiff) { diffFailed = true; return false; }
+        if (!rsScissor) {
+            D3D11_RASTERIZER_DESC rd{};
+            rd.FillMode = D3D11_FILL_SOLID;
+            rd.CullMode = D3D11_CULL_NONE;
+            rd.ScissorEnable = TRUE;
+            rd.DepthClipEnable = TRUE;
+            if (FAILED(dev->CreateRasterizerState(&rd, rsScissor.put()))) { diffFailed = true; return false; }
+        }
+        if (!qDiff) {
+            D3D11_QUERY_DESC qd{D3D11_QUERY_OCCLUSION_PREDICATE, 0};
+            if (FAILED(dev->CreateQuery(&qd, qDiff.put()))) { diffFailed = true; return false; }
+        }
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = TypelessFor(capFmt);
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+        sd.Format = capFmt;
+        bool ok = SUCCEEDED(dev->CreateTexture2D(&td, nullptr, cmpTex.put())) &&
+                  SUCCEEDED(dev->CreateShaderResourceView(cmpTex.get(), &sd, cmpSrv.put()));
+        if (ok) {
+            td.Format = DXGI_FORMAT_R8_UNORM;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET;
+            ok = SUCCEEDED(dev->CreateTexture2D(&td, nullptr, cmpRt.put())) &&
+                 SUCCEEDED(dev->CreateRenderTargetView(cmpRt.get(), nullptr, cmpRtv.put()));
+        }
+        if (!ok) {
+            cmpRtv.reset(); cmpSrv.reset(); cmpTex.reset(); cmpRt.reset();
+            diffFailed = true;
+            Log("Change detector: could not create resources, every desktop update will be redrawn");
+            return false;
+        }
+        return true;
+    }
+
+    // True if any pixel inside the current rects differs between cmpTex (new) and src[0] (stored).
+    // On any problem it answers true, which is the old behaviour (redraw).
+    bool RectsDiffer() {
+        D3D11_VIEWPORT vp{0, 0, (float)w, (float)h, 0, 1};
+        ctx->RSSetViewports(1, &vp);
+        ctx->RSSetState(rsScissor.get());
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx->IASetInputLayout(nullptr);
+        ctx->VSSetShader(vs.get(), nullptr, 0);
+        ctx->PSSetShader(psDiff.get(), nullptr, 0);
+        ID3D11ShaderResourceView* in[2] = {cmpSrv.get(), srv[0][0].get()};
+        ctx->PSSetShaderResources(2, 2, in);
+        ID3D11RenderTargetView* rt = cmpRtv.get();
+        ctx->OMSetRenderTargets(1, &rt, nullptr);
+        ctx->Begin(qDiff.get());
+        for (const RECT& r : rects) {
+            ctx->RSSetScissorRects(1, &r);
+            ctx->Draw(3, 0);
+        }
+        ctx->End(qDiff.get());
+        ID3D11ShaderResourceView* none[2] = {};
+        ctx->PSSetShaderResources(2, 2, none);
+        ctx->RSSetState(nullptr);
+        ctx->Flush();
+        BOOL any = TRUE;
+        LARGE_INTEGER t0, t1, f;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+        HRESULT hr;
+        while ((hr = ctx->GetData(qDiff.get(), &any, sizeof any, 0)) == S_FALSE) {
+            QueryPerformanceCounter(&t1);
+            if ((t1.QuadPart - t0.QuadPart) * 1000 > f.QuadPart * 4) return true;  // GPU busy: do not wait, just redraw
+            YieldProcessor();
+        }
+        return hr != S_OK || any != FALSE;
+    }
+
     // Same-GPU path: copy only the changed regions of the new frame into our persistent copy of the desktop
-    // (the first frame after a (re)start reports the whole screen as one region)
+    // (the first frame after a (re)start reports the whole screen as one region).
+    // Returns false when the pixels turned out to be identical to what we already have.
     bool IngestSameGpu(ID3D11Texture2D* frame) {
+        double area = 0;
+        for (const RECT& r : rects) area += (double)(r.right - r.left) * (r.bottom - r.top);
+        // Only large updates are checked: small ones are real in practice and not worth the extra pass
+        if (haveFrame && GetCfg().skipUnchanged && area >= 0.25 * w * h && EnsureDiff()) {
+            for (const RECT& r : rects) {
+                D3D11_BOX box = BoxOf(r);
+                ctx->CopySubresourceRegion(cmpTex.get(), 0, r.left, r.top, 0, frame, 0, &box);
+            }
+            if (!RectsDiffer()) { dSame++; return false; }
+            for (const RECT& r : rects) {
+                D3D11_BOX box = BoxOf(r);
+                ctx->CopySubresourceRegion(src[0].get(), 0, r.left, r.top, 0, cmpTex.get(), 0, &box);
+            }
+            cur = 0;
+            return true;
+        }
         for (const RECT& r : rects) {
             D3D11_BOX box = BoxOf(r);
             ctx->CopySubresourceRegion(src[0].get(), 0, r.left, r.top, 0, frame, 0, &box);
@@ -1148,19 +1309,66 @@ struct Renderer {
         if (FAILED(cctx->Map(stage.get(), 0, D3D11_MAP_READ, 0, &m))) return false;
         bool any = false;
         const size_t pitch = (size_t)w * 4;
+        const bool skip = haveFrame && GetCfg().skipUnchanged;
         for (const RECT& r : rects) {
             size_t bytes = (size_t)(r.right - r.left) * 4;
+            bool differs = !skip;
             for (LONG y = r.top; y < r.bottom; y++) {
                 const uint8_t* sp = (const uint8_t*)m.pData + (size_t)y * m.RowPitch + (size_t)r.left * 4;
-                memcpy(shadow.data() + (size_t)y * pitch + (size_t)r.left * 4, sp, bytes);
+                uint8_t* dp = shadow.data() + (size_t)y * pitch + (size_t)r.left * 4;
+                if (!differs && memcmp(dp, sp, bytes) != 0) differs = true;
+                memcpy(dp, sp, bytes);
             }
+            if (!differs) continue;
             D3D11_BOX box = BoxOf(r);
             ctx->UpdateSubresource(src[0].get(), 0, &box, shadow.data() + (size_t)r.top * pitch + (size_t)r.left * 4, (UINT)pitch, 0);
             any = true;
         }
+        if (!any && skip) dSame++;
         cctx->Unmap(stage.get(), 0);
         cur = 0;
         return any;
+    }
+
+    // GPU time of the draw, measured with timestamp queries and read back two frames later without stalling
+    void DiagGpuPoll() {
+        for (int k = 0; k < 3; k++) {
+            if (!dQReady[k]) continue;
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+            UINT64 t0 = 0, t1 = 0;
+            if (ctx->GetData(dQDisjoint[k].get(), &dj, sizeof dj, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+            if (ctx->GetData(dQStart[k].get(), &t0, sizeof t0, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+            if (ctx->GetData(dQEnd[k].get(), &t1, sizeof t1, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+            dQReady[k] = false;
+            if (!dj.Disjoint && dj.Frequency) dGpu.add((t1 - t0) * 1000.0 / dj.Frequency);
+        }
+    }
+    void DiagGpuBegin() {
+        DiagGpuPoll();
+        int k = dQWrite;
+        if (dQReady[k]) { dQPending = -1; return; }  // all slots still in flight: skip this frame
+        if (!dQDisjoint[k]) {
+            D3D11_QUERY_DESC qd{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+            if (FAILED(dev->CreateQuery(&qd, dQDisjoint[k].put()))) { dQPending = -1; return; }
+            qd.Query = D3D11_QUERY_TIMESTAMP;
+            if (FAILED(dev->CreateQuery(&qd, dQStart[k].put())) || FAILED(dev->CreateQuery(&qd, dQEnd[k].put()))) {
+                dQDisjoint[k].reset();
+                dQPending = -1;
+                return;
+            }
+        }
+        ctx->Begin(dQDisjoint[k].get());
+        ctx->End(dQStart[k].get());
+        dQPending = k;
+    }
+    void DiagGpuEnd() {
+        int k = dQPending;
+        if (k < 0) return;
+        ctx->End(dQEnd[k].get());
+        ctx->End(dQDisjoint[k].get());
+        dQReady[k] = true;
+        dQWrite = (k + 1) % 3;
+        dQPending = -1;
     }
 
     // FP16 target for the ClearType pre-pass, created lazily so QD-OLED users never pay the memory
@@ -1256,6 +1464,8 @@ struct Renderer {
             ctx->PSSetShaderResources(0, 1, &none1);
             sv = ctSrv.get();
         }
+        const bool diagOn = GetCfg().diag != 0;
+        if (diagOn) DiagGpuBegin();
         ctx->OMSetRenderTargets(1, &rt, nullptr);
         ctx->PSSetShader(ps.get(), nullptr, 0);
         ID3D11Buffer* b = cb.get();
@@ -1265,8 +1475,14 @@ struct Renderer {
         ctx->Draw(3, 0);
         ID3D11ShaderResourceView* nullSrv[2] = {};
         ctx->PSSetShaderResources(0, 2, nullSrv);
+        if (diagOn) DiagGpuEnd();
         if (cross && !TransferToDisplay()) return;
+        LARGE_INTEGER pf, p0, p1;
+        QueryPerformanceFrequency(&pf);
+        QueryPerformanceCounter(&p0);
         sc->Present(0, 0);
+        QueryPerformanceCounter(&p1);
+        dLastPresentMs = (p1.QuadPart - p0.QuadPart) * 1000.0 / pf.QuadPart;
         Show();
     }
 
@@ -1346,6 +1562,8 @@ struct Renderer {
         int frames = 0, dda = 0;
         bool pending = false;
         int motionTiles = 0;
+        LONGLONG pendingSince = 0;  // DWM present time of the oldest desktop frame not yet shown by the overlay
+        auto ms = [&](LONGLONG ticks) { return ticks * 1000.0 / (double)freq.QuadPart; };
         while (g_running) {
             if (g_restart.exchange(false)) {
                 Log("Restarting");
@@ -1392,8 +1610,12 @@ struct Renderer {
 
             DXGI_OUTDUPL_FRAME_INFO fi{};
             Com<IDXGIResource> res;
+            LARGE_INTEGER tA0, tA1;
+            QueryPerformanceCounter(&tA0);
             HRESULT hr = dup->AcquireNextFrame(timeout, &fi, res.put());
+            QueryPerformanceCounter(&tA1);
             if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+                if (c.diag && (pending || g_forceRedraw)) dTimeouts++;
                 // a pending draw is handled below
             } else if (FAILED(hr)) {
                 // ACCESS_LOST: mode change, UAC, fullscreen game, HDR toggle...
@@ -1412,14 +1634,30 @@ struct Renderer {
                 continue;
             } else {
                 dda++;
+                if (c.diag) dAcq.add(ms(tA1.QuadPart - tA0.QuadPart));
                 bool hasUpdate = !haveFrame || (fi.LastPresentTime.QuadPart != 0 && fi.TotalMetadataBufferSize > 0);
                 if (hasUpdate) {
                     GatherRects(fi);
+                    if (c.diag) {
+                        double area = 0;
+                        for (const RECT& r : rects) area += (double)(r.right - r.left) * (r.bottom - r.top);
+                        dArea.add(area);
+                        dMaxRects = std::max(dMaxRects, (int)rects.size());
+                    }
                     Com<ID3D11Texture2D> t;
                     if (!rects.empty() && SUCCEEDED(res.as(t))) {
+                        LARGE_INTEGER tI0, tI1;
+                        QueryPerformanceCounter(&tI0);
                         bool changed = cross ? IngestCross(t.get()) : IngestSameGpu(t.get());
+                        QueryPerformanceCounter(&tI1);
+                        if (c.diag) {
+                            double d = ms(tI1.QuadPart - tI0.QuadPart);
+                            dIngest.add(d);
+                            if (d > 4.0 && dSlowLogs < 60) { dSlowLogs++; Log("DIAG slow ingest %.1f ms, %zu rects", d, rects.size()); }
+                        }
                         haveFrame = true;
                         if (changed) {
+                            if (!pending && fi.LastPresentTime.QuadPart) pendingSince = fi.LastPresentTime.QuadPart;
                             pending = true;
                             QueryPerformanceCounter(&now);
                             MarkTiles(now.QuadPart, freq.QuadPart, c);
@@ -1445,14 +1683,52 @@ struct Renderer {
                     if (g_forceRedraw) accFull = true;  // settings changed: the whole screen must be transferred again
                     g_forceRedraw = false;
                     pending = false;
+                    LARGE_INTEGER tR0, tR1;
+                    QueryPerformanceCounter(&tR0);
                     Render();
+                    QueryPerformanceCounter(&tR1);
                     lastRender = now;
                     frames++;
+                    if (c.diag) {
+                        double rm = ms(tR1.QuadPart - tR0.QuadPart);
+                        dRender.add(rm);
+                        dPresent.add(dLastPresentMs);
+                        dMaxTiles = std::max(dMaxTiles, motionTiles);
+                        if (pendingSince) {
+                            double lat = ms(tR1.QuadPart - pendingSince);
+                            if (lat >= 0 && lat < 1000) {
+                                dLat.add(lat);
+                                dBuckets[lat < 4 ? 0 : lat < 8 ? 1 : lat < 16 ? 2 : 3]++;
+                            }
+                        }
+                        if (rm > 8.0 && dSlowLogs < 60) { dSlowLogs++; Log("DIAG slow render %.1f ms (present %.1f ms), %d moving tiles", rm, dLastPresentMs, motionTiles); }
+                    }
+                    pendingSince = 0;
                 }
             }
 
             QueryPerformanceCounter(&now);
             if (now.QuadPart - statT0.QuadPart >= freq.QuadPart) {
+                if (c.diag) {
+                    if (!dHeader) {
+                        dHeader = true;
+                        Log("DIAG v%s capture=%s %ux%u cross=%d fpsCap=%d motion=%d(%d frames/%d ms, settle %d ms) linear=%d kernel=%d ctCancel=%d preset=%ls",
+                            APP_VERSION, FormatName(capFmt), w, h, cross ? 1 : 0, c.fpsCap, c.motionBypass, c.motionFrames,
+                            c.motionWindowMs, c.motionSettleMs, c.linear, c.kernel, c.ctCancel, c.preset);
+                        Log("DIAG columns: dda=desktop updates/s draw=overlay frames/s acq=AcquireNextFrame ms ingest=CPU copy ms render=Render() CPU ms "
+                            "present=Present() ms gpu=draw GPU ms lat=DWM present -> overlay Present returned (avg/max ms) buckets=<4/<8/<16/>=16 ms same=updates with identical pixels (skipped)");
+                    }
+                    if (dda || frames) {
+                        Log("DIAG dda=%d draw=%d moveTiles<=%d rects<=%d area=%.0f/%.0f px acq=%.2f/%.2f ingest=%.2f/%.2f render=%.2f/%.2f "
+                            "present=%.2f/%.2f gpu=%.2f/%.2f lat=%.2f/%.2f buckets=%d/%d/%d/%d timeouts=%d same=%d",
+                            dda, frames, dMaxTiles, dMaxRects, dArea.avg(), dArea.mx, dAcq.avg(), dAcq.mx, dIngest.avg(), dIngest.mx,
+                            dRender.avg(), dRender.mx, dPresent.avg(), dPresent.mx, dGpu.avg(), dGpu.mx, dLat.avg(), dLat.mx,
+                            dBuckets[0], dBuckets[1], dBuckets[2], dBuckets[3], dTimeouts, dSame);
+                    }
+                    dAcq.reset(); dIngest.reset(); dRender.reset(); dPresent.reset(); dGpu.reset(); dLat.reset(); dArea.reset();
+                    dBuckets[0] = dBuckets[1] = dBuckets[2] = dBuckets[3] = 0;
+                    dMaxRects = dMaxTiles = dTimeouts = dSame = 0;
+                }
                 g_fps = frames;
                 g_ddaFps = dda;
                 frames = dda = 0;
