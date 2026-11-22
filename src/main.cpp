@@ -580,6 +580,7 @@ struct Renderer {
     Com<ID3D11UnorderedAccessView> flagUav;
     UINT w = 0, h = 0;
     bool haveFrame = false;
+    LONGLONG lastRealChange = 0;  // QPC time of the last frame that really changed (same-GPU compare is skipped while this is recent)
     std::vector<uint8_t> meta;
     std::vector<RECT> rects;
     // cross-adapter mode: the result drawn on the processing GPU is moved to the display GPU via the CPU;
@@ -1009,7 +1010,14 @@ struct Renderer {
         int nxt = 1 - cur;
         ctx->CopyResource(src[nxt].get(), frame);
         bool changed = true;
-        if (haveFrame && skipStatic && !rects.empty()) {
+        // The compare needs a blocking read-back of a flag, which stalls the pipeline. Only do it when the
+        // content has been quiet: while something is moving (dragging a window or cards) nearly every frame
+        // really changes, so the compare would only add latency.
+        LARGE_INTEGER qn, qf;
+        QueryPerformanceCounter(&qn);
+        QueryPerformanceFrequency(&qf);
+        bool quiet = qn.QuadPart - lastRealChange > qf.QuadPart * 150 / 1000;
+        if (haveFrame && skipStatic && quiet && !rects.empty()) {
             UINT zero[4] = {0, 0, 0, 0};
             ctx->ClearUnorderedAccessViewUint(flagUav.get(), zero);
             ID3D11ShaderResourceView* views[2] = {srv[nxt][0].get(), srv[cur][0].get()};
@@ -1038,7 +1046,10 @@ struct Renderer {
                 ctx->Unmap(flagStage.get(), 0);
             }
         }
-        if (changed) cur = nxt;
+        if (changed) {
+            cur = nxt;
+            lastRealChange = qn.QuadPart;
+        }
         return changed;
     }
 
