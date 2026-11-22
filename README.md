@@ -200,6 +200,16 @@ around ClearType text on a WOLED is mostly ClearType's own, and shifting channel
 barely changes it (simulated colour error reduced by only 2–10%). Reports from WOLED users are very
 welcome.
 
+### Luma shift (experimental)
+
+The two **Luma** sliders (WOLED presets only, greyed out otherwise) move all three channels together, in
+pixels, so they shift the brightness of the text without changing the colour correction. They are meant for
+panels where the white subpixel pulls the brightness to one side of the letters (a soft "shadow" on one edge).
+QD-OLED has no white subpixel and does not need them. They do not remove such an effect by themselves, and the
+right values depend on the panel, so tune them by eye with the Compare option. Fractional values soften the
+text slightly. Both are 0 by default, are not stored in presets and are reset when a preset is applied. INI keys: `LumShiftX`,
+`LumShiftY` (`[Filter]`, range -1 to 1).
+
 ### ClearType colour removal (experimental, 1.2.0)
 
 **Remove ClearType colour fringes (WOLED, experimental)** in Settings adds a first pass that removes

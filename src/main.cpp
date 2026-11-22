@@ -109,6 +109,9 @@ static int NormalizeKernel(int k) {
     return k;
 }
 
+#ifndef OTF_TEST_DEFAULT
+#define OTF_TEST_DEFAULT 0
+#endif
 #ifndef OTF_DIAG_DEFAULT
 #define OTF_DIAG_DEFAULT 0  // the diagnostic build (build.sh diag) turns the timing log on by default
 #endif
@@ -119,6 +122,9 @@ struct Config {
     // [channel R,G,B][x,y]   (y positive downwards)
     float off[3][2] = {{-0.22f, 0.50f}, {0.0f, 0.0f}, {0.27f, 0.52f}};
     float strength = 0.90f;
+    // Experimental: shifts all three channels together (the luminance), in pixels, for panels whose white subpixel
+    // moves the brightness away from the colour centroid. 0 = off. Not part of presets.
+    float lumX = 0.0f, lumY = 0.0f;
     int kernel = K_CATMULL;
     int linear = 1;          // process in linear light (physically correct)
     int cleartype = 0;       // ClearType-compatible mode: account for ClearType's own horizontal shift
@@ -135,6 +141,7 @@ struct Config {
     int motionSettleMs = 250;  // re-apply the correction this long after motion stops
     int updateCheck = 1;       // look for a newer release on GitHub and install it
     int hdr = 0;               // experimental: process HDR (scRGB) desktops instead of pausing
+    int overlayTest = OTF_TEST_DEFAULT;      // [Debug] OverlayTest=1: paint the left third of the overlay magenta (is the overlay visible at all?)
     int diag = OTF_DIAG_DEFAULT;  // write latency / timing statistics to OLEDTextFix.log once per second
     // Experimental (WOLED only): remove the colour ClearType adds to grey text before the subpixel correction.
     int ctCancel = 0;          // 1 = on (still needs a WOLED preset and 8-bit capture)
@@ -276,6 +283,7 @@ static void LoadConfig() {
     c.updateCheck = IniInt(L"General", L"CheckForUpdates", c.updateCheck);
     c.hdr = IniInt(L"General", L"ExperimentalHDR", c.hdr);
     c.diag = IniInt(L"Debug", L"Diagnostics", c.diag);
+    c.overlayTest = std::max(0, std::min(2, IniInt(L"Debug", L"OverlayTest", c.overlayTest)));
     GetPrivateProfileStringW(L"General", L"Preset", c.preset, c.preset, 64, g_iniPath);
     GetPrivateProfileStringW(L"Performance", L"Gpu", c.gpu, c.gpu, 128, g_iniPath);
     c.fpsCap = IniInt(L"Performance", L"FpsCap", c.fpsCap);
@@ -287,6 +295,8 @@ static void LoadConfig() {
     for (int ch = 0; ch < 3; ch++)
         for (int a = 0; a < 2; a++) c.off[ch][a] = IniFloat(L"Subpixel", kChKeys[ch][a], c.off[ch][a]);
     c.strength = IniFloat(L"Filter", L"Strength", c.strength);
+    c.lumX = std::max(-1.0f, std::min(1.0f, IniFloat(L"Filter", L"LumShiftX", c.lumX)));
+    c.lumY = std::max(-1.0f, std::min(1.0f, IniFloat(L"Filter", L"LumShiftY", c.lumY)));
     c.kernel = IniInt(L"Filter", L"Kernel", c.kernel);
     c.linear = IniInt(L"Filter", L"LinearLight", c.linear);
     c.ctCancel = IniInt(L"Filter", L"ClearTypeCancel", c.ctCancel) ? 1 : 0;
@@ -329,6 +339,8 @@ static void SaveConfig() {
     for (int ch = 0; ch < 3; ch++)
         for (int a = 0; a < 2; a++) IniPutF(L"Subpixel", kChKeys[ch][a], c.off[ch][a]);
     IniPutF(L"Filter", L"Strength", c.strength);
+    IniPutF(L"Filter", L"LumShiftX", c.lumX);
+    IniPutF(L"Filter", L"LumShiftY", c.lumY);
     IniPutI(L"Filter", L"Kernel", c.kernel);
     IniPutI(L"Filter", L"LinearLight", c.linear);
     IniPutI(L"Filter", L"ClearTypeMode", c.cleartype);
@@ -511,6 +523,18 @@ float4 VSMain(uint id : SV_VertexID) : SV_Position {
 
 float4 PSMain(float4 pos : SV_Position) : SV_Target {
     int2 p = int2(pos.xy);
+    if (tileInfo.z == 1 && p.x < sz.x / 3) return float4(1, 0, 1, 1);  // [Debug] OverlayTest=1: solid magenta band
+    if (tileInfo.z == 2) {
+        // OverlayTest=2: left third = inverted capture, right third = fixed 6 px red/blue split, independent of all
+        // settings (shows whether the capture reaches the screen and whether this shader can change pixels at all)
+        int3 q = int3(p, 0);
+        if (p.x < sz.x / 3) return float4(1.0 - tex.Load(q).rgb, 1.0);
+        if (p.x > (2 * sz.x) / 3) {
+            float rr = tex.Load(int3(clamp(p + int2(6, 0), int2(0, 0), sz.xy), 0)).r;
+            float bb = tex.Load(int3(clamp(p - int2(6, 0), int2(0, 0), sz.xy), 0)).b;
+            return float4(rr, tex.Load(q).g, bb, 1.0);
+        }
+    }
     // Moving region: leave fully transparent so the real desktop shows through without latency
     if (motionMask.Load(int3(p / tileInfo.x, 0)) > 0.5) return float4(0, 0, 0, 0);
     float r = 0, g = 0, b = 0;
@@ -672,6 +696,7 @@ struct Renderer {
     DiagStat dAcq, dIngest, dRender, dPresent, dGpu, dLat, dArea;
     int dBuckets[4] = {0, 0, 0, 0}, dMaxRects = 0, dMaxTiles = 0, dTimeouts = 0, dSlowLogs = 0;
     double dLastPresentMs = 0;
+    int dPresentLogs = 0, dOvTick = 0;
     Com<ID3D11Query> dQDisjoint[3], dQStart[3], dQEnd[3];
     int dQWrite = 0, dQPending = 0;
     bool dQReady[3] = {false, false, false};
@@ -1149,7 +1174,8 @@ struct Renderer {
         }
         haveFrame = false;  // never show a stale frame when restarting
         accFull = true;
-        Log("Capture started %ux%u", w, h);
+        Log("Capture started %ux%u @ %.2f Hz", w, h,
+            dd.ModeDesc.RefreshRate.Denominator ? (double)dd.ModeDesc.RefreshRate.Numerator / dd.ModeDesc.RefreshRate.Denominator : 0.0);
         return true;
     }
 
@@ -1404,6 +1430,7 @@ struct Renderer {
         bool ctOn = !bypass && c.ctCancel && c.woled && capFmt == DXGI_FORMAT_B8G8R8A8_UNORM && EnsureCt();
         lastCtOn = ctOn;
         CBData d{};
+        const float lumX = c.woled ? c.lumX : 0.0f, lumY = c.woled ? c.lumY : 0.0f;  // WOLED layouts only
         for (int ch = 0; ch < 3; ch++) {
             if (bypass) {
                 d.base[ch][0] = d.base[ch][1] = -1;
@@ -1415,13 +1442,14 @@ struct Renderer {
                 // (reversed for BGR). Required shift = panel position - position ClearType assumes.
                 float ct = 0;
                 if (c.cleartype && !ctOn && ch != 1) ct = ((ch == 0) != g_ctBGR.load()) ? -1.0f / 3 : 1.0f / 3;
-                ChannelTaps((c.off[ch][0] - ct) * c.strength, c.kernel, d.base[ch][0], d.wx[ch]);
-                ChannelTaps(c.off[ch][1] * c.strength, c.kernel, d.base[ch][1], d.wy[ch]);
+                ChannelTaps((c.off[ch][0] - ct) * c.strength + lumX, c.kernel, d.base[ch][0], d.wx[ch]);
+                ChannelTaps(c.off[ch][1] * c.strength + lumY, c.kernel, d.base[ch][1], d.wy[ch]);
             }
         }
         d.size[0] = (int)w - 1;
         d.size[1] = (int)h - 1;
         d.tile[0] = TILE;
+        d.tile[2] = c.overlayTest;
         d.tile[1] = capFmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 0;  // scRGB: no clamping
         ctx->UpdateSubresource(maskTex.get(), 0, nullptr, mask.data(), (UINT)tw, 0);
         lastMask = mask;
@@ -1480,8 +1508,9 @@ struct Renderer {
         LARGE_INTEGER pf, p0, p1;
         QueryPerformanceFrequency(&pf);
         QueryPerformanceCounter(&p0);
-        sc->Present(0, 0);
+        HRESULT ph = sc->Present(0, 0);
         QueryPerformanceCounter(&p1);
+        if (ph != S_OK && dPresentLogs < 20) { dPresentLogs++; Log("Present returned 0x%08lx", (unsigned long)ph); }
         dLastPresentMs = (p1.QuadPart - p0.QuadPart) * 1000.0 / pf.QuadPart;
         Show();
     }
@@ -1718,6 +1747,23 @@ struct Renderer {
                         Log("DIAG columns: dda=desktop updates/s draw=overlay frames/s acq=AcquireNextFrame ms ingest=CPU copy ms render=Render() CPU ms "
                             "present=Present() ms gpu=draw GPU ms lat=DWM present -> overlay Present returned (avg/max ms) buckets=<4/<8/<16/>=16 ms same=updates with identical pixels (skipped)");
                     }
+                    if (++dOvTick % 10 == 1) {  // overlay window state: is it visible, cloaked by DWM, on the right display?
+                        DWORD cloaked = 0;
+                        DwmGetWindowAttribute(g_overlay, DWMWA_CLOAKED, &cloaked, sizeof cloaked);
+                        RECT orc{};
+                        GetWindowRect(g_overlay, &orc);
+                        MONITORINFOEXW mi{};
+                        mi.cbSize = sizeof mi;
+                        DEVMODEW dm{};
+                        dm.dmSize = sizeof dm;
+                        unsigned long hz = 0;
+                        if (GetMonitorInfoW(g_targetMon.load(), &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) hz = dm.dmDisplayFrequency;
+                        Log("DIAG overlay visible=%d cloaked=%lu rect=%ld,%ld,%ld,%ld monitor=%ld,%ld,%ld,%ld refresh=%luHz test=%d bypass=%d strength=%.2f kernel=%d linear=%d opaque=%d off R(%.2f,%.2f) G(%.2f,%.2f) B(%.2f,%.2f) cleartype=%d ctCancel=%d",
+                            IsWindowVisible(g_overlay) ? 1 : 0, (unsigned long)cloaked, orc.left, orc.top, orc.right, orc.bottom,
+                            mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom, hz, c.overlayTest,
+                            g_bypass.load() ? 1 : 0, c.strength, c.kernel, c.linear, c.overlayAlpha == 255 ? 1 : 0,
+                            c.off[0][0], c.off[0][1], c.off[1][0], c.off[1][1], c.off[2][0], c.off[2][1], c.cleartype, c.ctCancel);
+                    }
                     if (dda || frames) {
                         Log("DIAG dda=%d draw=%d moveTiles<=%d rects<=%d area=%.0f/%.0f px acq=%.2f/%.2f ingest=%.2f/%.2f render=%.2f/%.2f "
                             "present=%.2f/%.2f gpu=%.2f/%.2f lat=%.2f/%.2f buckets=%d/%d/%d/%d timeouts=%d same=%d",
@@ -1882,6 +1928,7 @@ static void ApplyPreset(int i) {
     EditCfg([&](Config& c) {
         memcpy(c.off, p.off, sizeof c.off);
         c.strength = p.strength;
+        c.lumX = c.lumY = 0.0f;  // the luminance shift is not stored in presets
         c.kernel = p.kernel;
         c.woled = p.woled;
         wcsncpy(c.preset, p.name.c_str(), 63);
@@ -2155,8 +2202,8 @@ enum {
     IDC_SAVE, IDC_DEFAULTS, IDC_CLOSE, IDC_GPU, IDC_FPSCAP, IDC_OPAQUE, IDC_MOTION, IDC_HDR, IDC_CTCANCEL, IDC_SLIDER0 = 1100,
 };
 
-static const int kSliders = 7;  // 0..5: RX RY GX GY BX BY, 6: strength
-static const wchar_t* kSliderNames[kSliders] = {L"Red  X", L"Red  Y", L"Green  X", L"Green  Y", L"Blue  X", L"Blue  Y", L"Strength"};
+static const int kSliders = 9;  // 0..5: RX RY GX GY BX BY, 6: strength, 7..8: luminance shift X Y
+static const wchar_t* kSliderNames[kSliders] = {L"Red  X", L"Red  Y", L"Green  X", L"Green  Y", L"Blue  X", L"Blue  Y", L"Strength", L"Luma X (WOLED)", L"Luma Y (WOLED)"};
 
 struct SettingsUI {
     HWND wnd = nullptr, pattern = nullptr;
@@ -2182,7 +2229,7 @@ static void UpdateSliderLabel(int i) {
     if (!g_ui.wnd) return;
     int pos = (int)SendMessageW(g_ui.sl[i], TBM_GETPOS, 0, 0);
     wchar_t b[32];
-    if (i < 6) swprintf(b, 32, L"%+.2f px", pos / 100.0);
+    if (i < 6 || i >= 7) swprintf(b, 32, L"%+.2f px", pos / 100.0);
     else swprintf(b, 32, L"%.2f", pos / 100.0);
     SetWindowTextW(g_ui.val[i], b);
 }
@@ -2235,7 +2282,14 @@ static void SyncControls() {
     for (int i = 0; i < 6; i++)
         SendMessageW(g_ui.sl[i], TBM_SETPOS, TRUE, (LPARAM)lroundf(c.off[i / 2][i % 2] * 100));
     SendMessageW(g_ui.sl[6], TBM_SETPOS, TRUE, (LPARAM)lroundf(c.strength * 100));
+    SendMessageW(g_ui.sl[7], TBM_SETPOS, TRUE, (LPARAM)lroundf(c.lumX * 100));
+    SendMessageW(g_ui.sl[8], TBM_SETPOS, TRUE, (LPARAM)lroundf(c.lumY * 100));
     for (int i = 0; i < kSliders; i++) UpdateSliderLabel(i);
+    for (int i = 7; i < 9; i++) {  // the luminance shift only applies to WOLED layouts
+        EnableWindow(g_ui.sl[i], c.woled);
+        EnableWindow(g_ui.lblSl[i], c.woled);
+        EnableWindow(g_ui.val[i], c.woled);
+    }
     for (int i = 0; i < kKernelListN; i++)
         if (kKernelList[i] == c.kernel) SendMessageW(g_ui.cmbKernel, CB_SETCURSEL, i, 0);
     SendMessageW(g_ui.cmbMon, CB_SETCURSEL, c.monitor < 0 ? 0 : c.monitor + 1, 0);
@@ -2341,7 +2395,7 @@ static void Layout() {
     Place(g_ui.pattern, px, 0, std::max(10, (int)rc.right - px), rc.bottom);
 }
 
-static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 975;
+static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 1035;
 
 static void ResizeForDpi() {
     RECT r{0, 0, S(kClientW), S(kClientH)};
@@ -2376,7 +2430,7 @@ static void CreateControls() {
     for (int i = 0; i < kSliders; i++) {
         g_ui.lblSl[i] = Mk(L"STATIC", kSliderNames[i], 0, 0);
         g_ui.sl[i] = Mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_BOTH | TBS_NOTICKS | WS_TABSTOP, IDC_SLIDER0 + i);
-        if (i < 6) SendMessageW(g_ui.sl[i], TBM_SETRANGE, TRUE, MAKELPARAM(-100, 100));
+        if (i != 6) SendMessageW(g_ui.sl[i], TBM_SETRANGE, TRUE, MAKELPARAM(-100, 100));
         else SendMessageW(g_ui.sl[i], TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
         SendMessageW(g_ui.sl[i], TBM_SETLINESIZE, 0, 1);
         SendMessageW(g_ui.sl[i], TBM_SETPAGESIZE, 0, 5);
@@ -2510,7 +2564,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 float v = (int)SendMessageW(g_ui.sl[i], TBM_GETPOS, 0, 0) / 100.0f;
                 EditCfg([&](Config& c) {
                     if (i < 6) c.off[i / 2][i % 2] = v;
-                    else c.strength = v;
+                    else if (i == 6) c.strength = v;
+                    else if (i == 7) c.lumX = v;
+                    else c.lumY = v;
                 });
                 UpdateSliderLabel(i);
                 MarkCustom();
