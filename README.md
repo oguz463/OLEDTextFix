@@ -65,6 +65,8 @@ grayscale and ClearType text), showing the corrected image as you move the slide
 - **Process in linear light**: the physically correct method; keep it on.
 - **ClearType-compatible mode**: see [ClearType](#cleartype). The line underneath shows the
   current Windows ClearType setting.
+- **Remove ClearType colour fringes (WOLED, experimental)**: see
+  [ClearType colour removal](#cleartype-colour-removal-experimental-120).
 - **Pause for fullscreen games/video** (including borderless fullscreen) and **Start with Windows**.
 - **Monitor**: which display to correct.
 - **Preset**, plus **Save as preset** / **Delete** for your own presets.
@@ -160,10 +162,12 @@ blur text there.
 `tools/sim_qd_strength.py` sweeps strength from 0.5 to 1.2 on every measured QD-OLED class. In the
 simulation, fringing reduction peaks at 1.00–1.10 and falls off above that (overshoot), so 1.00 is
 the most accurate setting. It is also the one that softens text the most, because the red and blue
-channels are moved by about half a pixel vertically. The presets therefore use **0.80**, which keeps
-roughly 88% of the fringing reduction (about 51% instead of 58% with Sharp, dark background) and
-looks crisper. Raise **Strength** towards 1.00 if colour fringes bother you more than softness;
-lower it if text still looks soft. Settings you have already saved are not changed.
+channels are moved by about half a pixel vertically. The presets use **0.90** (since 1.2.0, before
+that 0.80): in a second simulation with a perceptual colour metric it gave 10–12% less colour error
+than 0.80 on every QD-OLED class, while 1.00 gained only 2–5% more and made the red and blue channels
+slightly softer. Raise **Strength** towards 1.00 if colour fringes bother you more than softness;
+lower it (0.80) if text still looks soft. Adding an unsharp mask on top did not help in simulation:
+whatever restores crispness also restores the fringing. Settings you have already saved are not changed.
 
 ## ClearType
 
@@ -181,14 +185,45 @@ off.
 On WOLED panels the white subpixel is driven by the panel itself from the incoming RGB value.
 Shifting colours adds colour to pixels, so the panel lights less white there; too much correction
 therefore increases fringing. The presets keep the white column as the reference and use strength
-0.20, which reduced fringing (about 28–30% on average) and kept text sharp in every simulated case
-(`tools/sim_woled.py`); 0.30 and above made bright content worse.
+0.20, which reduced fringing (about 28–30% on average) with grayscale text and kept text sharp in
+every simulated case (`tools/sim_woled.py`). The best strength depends on how much of the white a
+panel's own RGB-to-RGBW conversion puts into the white subpixel, which nobody has measured; in
+simulation it ranged from about 0.15 to 0.40, so 0.20 is a safe default rather than an optimum.
 
-1. Use grayscale antialiasing and turn ClearType-compatible mode off.
+1. Use grayscale antialiasing and turn ClearType-compatible mode off. This is the biggest single
+   improvement on WOLED.
 2. Pick the preset for your panel and keep the Sharp filter.
 3. Check with **Compare**; try strengths between 0.10 and 0.30.
 
-Expect a modest improvement at best. Reports from WOLED users are very welcome.
+Expect a modest improvement at best, and **almost none with ClearType text**: the colour you see
+around ClearType text on a WOLED is mostly ClearType's own, and shifting channels by about 0.1 px
+barely changes it (simulated colour error reduced by only 2–10%). Reports from WOLED users are very
+welcome.
+
+### ClearType colour removal (experimental, 1.2.0)
+
+**Remove ClearType colour fringes (WOLED, experimental)** in Settings adds a first pass that removes
+the colour ClearType puts on grey, white and black text before the normal correction runs. A pixel is
+only touched when three tests agree that it is ClearType text: the colour cancels along the row, the
+neighbourhood has text-like brightness contrast, and the signal at subpixel rate is smooth. Each
+touched pixel keeps its exact brightness and loses its colour. Coloured text (links, syntax
+highlighting), icons, photos and video are left alone.
+
+- It is **off by default**, only acts with a WOLED preset and 8-bit desktop capture, and does nothing
+  when Windows ClearType is off (the status line under the checkbox says which). It does not apply
+  to QD-OLED: ClearType's red/blue placement already matches that layout, so removing the colour
+  gives no gain there and softens text.
+- **What was measured (simulation only):** on neutral ClearType text it removed 38–85% of the colour
+  error compared with 1.1, depending on the assumed white-subpixel share, which is about what
+  switching Windows to grayscale text gives. In simulated coloured UI cards 0.0% of pixels changed,
+  in four real photos at most 0.03%, and text became up to about 4% softer.
+- **What was not measured:** anything on a real monitor, real ClearType output (DirectWrite, GDI,
+  Chrome/Skia at different Tuner settings: the thresholds come from an idealised filter), HDR and
+  10-bit desktops (the pass is skipped there), and GPU cost (one extra full-screen FP16 pass; about
+  66 MB at 4K). Run `python3 tools/ct_gate_report.py screenshot.png` on a lossless Win+PrtScn
+  capture to see how many pixels it would change.
+- Grayscale text everywhere is still better where it is available, because it is also crisper.
+- The thresholds can be changed in `OLEDTextFix.ini` (`[Filter]`, keys starting with `CTCancel`).
 
 ## Performance
 
@@ -308,7 +343,12 @@ GitHub Actions builds every push and pull request. A release is published when `
 `v*` tag is pushed.
 
 The `tools/` folder holds the simulations behind the numbers above (Python with NumPy, SciPy and
-Pillow): `sim.py` (QD-OLED model), `sim_filters.py`, `sim_cleartype.py` and `sim_woled.py`.
+Pillow): `sim.py` (QD-OLED model), `sim_filters.py`, `sim_cleartype.py` and `sim_woled.py`. `tools/ct_gate_report.py` checks the ClearType colour-removal
+pass against screenshots.
+
+Tests: `sh tests/run.sh` builds and runs the native tests for the pure logic in `src/core.h` (filter
+weights, version comparison, WOLED preset names, the ClearType gate) and, when `glslangValidator` is
+installed, syntax-checks the HLSL in `src/main.cpp`. They need no Windows and no GPU.
 
 ## License
 

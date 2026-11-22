@@ -89,12 +89,13 @@ static void Log(const char* fmt, ...) {
     ReleaseSRWLockExclusive(&g_logLock);
 }
 
+#include "core.h"
+
 // ---------------------------------------------------------------- config
 
 // Filters (all bicubic). Values are stored in the INI file: 0 and 1 were Bilinear and Mitchell in
 // earlier builds and are converted on load (see NormalizeKernel). The three that remain are the best trade-offs
 // between fringing and sharpness found in tools/sim_filters.py; no other 4-6 tap filter tested did better.
-enum Kernel { K_OLD_BILINEAR = 0, K_OLD_MITCHELL = 1, K_CATMULL = 2, K_BALANCED = 3, K_SMOOTH = 4, K_COUNT };
 static const int kKernelList[] = {K_CATMULL, K_BALANCED, K_SMOOTH};  // order in the drop-down list
 static const int kKernelListN = 3;
 static const wchar_t* KernelName(int k) {
@@ -113,7 +114,7 @@ struct Config {
     // Physical position of each channel's subpixel relative to the pixel centre (in pixels)
     // [channel R,G,B][x,y]   (y positive downwards)
     float off[3][2] = {{-0.22f, 0.50f}, {0.0f, 0.0f}, {0.27f, 0.52f}};
-    float strength = 0.80f;
+    float strength = 0.90f;
     int kernel = K_CATMULL;
     int linear = 1;          // process in linear light (physically correct)
     int cleartype = 0;       // ClearType-compatible mode: account for ClearType's own horizontal shift
@@ -129,6 +130,13 @@ struct Config {
     int motionSettleMs = 250;  // re-apply the correction this long after motion stops
     int updateCheck = 1;       // look for a newer release on GitHub and install it
     int hdr = 0;               // experimental: process HDR (scRGB) desktops instead of pausing
+    // Experimental (WOLED only): remove the colour ClearType adds to grey text before the subpixel correction.
+    int ctCancel = 0;          // 1 = on (still needs a WOLED preset and 8-bit capture)
+    bool woled = false;        // the active preset is a WOLED layout (set by ApplyPreset / LoadConfig)
+    float ctQ0 = 0.50f, ctQ1 = 0.80f;      // colour-cancellation gate: |mean chroma| / mean |chroma| ramp
+    float ctLuma = 0.25f;                  // minimum luma contrast in the 7-px window (text-like edge)
+    float ctRough0 = 1.00f, ctRough1 = 1.30f;  // subpixel roughness ramp (ClearType is smooth, UI/photos are not)
+    float ctAmount = 1.0f;
 };
 
 struct Preset {
@@ -137,7 +145,9 @@ struct Preset {
     float strength;
     int kernel;
     bool builtin;
+    bool woled = false;
 };
+
 
 // QD-OLED subpixel layouts measured from macro photos with tools/measure_subpixels.js. Red/blue positions relative
 // to green, in pixel pitch; green stays fixed so luminance is not resampled (sharpest). Each value is the median
@@ -153,17 +163,17 @@ struct Preset {
 #define WO_RGWB {{-0.50f, 0.0f}, {-0.25f, 0.0f}, {0.22f, 0.0f}}  // R G W B: 6 photos
 
 static const Preset kBuiltinPresets[] = {
-    {L"27\" 1440p 240/280 Hz QD-OLED", QD_27QHD, 0.80f, K_CATMULL, true},
-    {L"27\" 1440p 360 Hz QD-OLED (Gen 3, 2024)", QD_27QHD, 0.80f, K_CATMULL, true},
-    {L"27\" 1440p 500 Hz QD-OLED (Gen 3 update, 2025)", QD_27QHD, 0.80f, K_CATMULL, true},
-    {L"27\" 4K 240 Hz QD-OLED (Gen 4, 2025)", QD_27_4K, 0.80f, K_CATMULL, true},
-    {L"32\" 4K 165 Hz QD-OLED", QD_32_4K, 0.80f, K_CATMULL, true},
-    {L"32\" 4K 240 Hz QD-OLED (Gen 3, 2024)", QD_32_4K, 0.80f, K_CATMULL, true},
-    {L"34\" 3440x1440 165/175 Hz QD-OLED (Gen 1, 2022)", QD_UW34, 0.80f, K_CATMULL, true},
-    {L"34\" 3440x1440 240 Hz QD-OLED (Gen 2, 2024)", QD_UW34, 0.80f, K_CATMULL, true},
-    {L"49\" 5120x1440 144/240 Hz QD-OLED (Gen 2, 2023)", QD_SUW49, 0.80f, K_CATMULL, true},
-    {L"Any QD-OLED triad — vertical only", {{0.0f, 0.50f}, {0.0f, 0.0f}, {0.0f, 0.50f}}, 0.80f, K_CATMULL, true},
-    {L"QD-OLED legacy estimate (early QDTextFix default)", {{-0.20f, 0.20f}, {0.0f, -0.20f}, {0.20f, 0.20f}}, 0.80f, K_CATMULL, true},
+    {L"27\" 1440p 240/280 Hz QD-OLED", QD_27QHD, 0.90f, K_CATMULL, true},
+    {L"27\" 1440p 360 Hz QD-OLED (Gen 3, 2024)", QD_27QHD, 0.90f, K_CATMULL, true},
+    {L"27\" 1440p 500 Hz QD-OLED (Gen 3 update, 2025)", QD_27QHD, 0.90f, K_CATMULL, true},
+    {L"27\" 4K 240 Hz QD-OLED (Gen 4, 2025)", QD_27_4K, 0.90f, K_CATMULL, true},
+    {L"32\" 4K 165 Hz QD-OLED", QD_32_4K, 0.90f, K_CATMULL, true},
+    {L"32\" 4K 240 Hz QD-OLED (Gen 3, 2024)", QD_32_4K, 0.90f, K_CATMULL, true},
+    {L"34\" 3440x1440 165/175 Hz QD-OLED (Gen 1, 2022)", QD_UW34, 0.90f, K_CATMULL, true},
+    {L"34\" 3440x1440 240 Hz QD-OLED (Gen 2, 2024)", QD_UW34, 0.90f, K_CATMULL, true},
+    {L"49\" 5120x1440 144/240 Hz QD-OLED (Gen 2, 2023)", QD_SUW49, 0.90f, K_CATMULL, true},
+    {L"Any QD-OLED triad — vertical only", {{0.0f, 0.50f}, {0.0f, 0.0f}, {0.0f, 0.50f}}, 0.90f, K_CATMULL, true},
+    {L"QD-OLED legacy estimate (early QDTextFix default)", {{-0.20f, 0.20f}, {0.0f, -0.20f}, {0.20f, 0.20f}}, 0.90f, K_CATMULL, true},
     // LG WOLED: each pixel is four vertical columns, R W B G (older panels) or R G W B (2024+). Positions
     // are taken relative to the white column: the panel derives white from the input itself, so keeping it
     // as the reference preserves sharpness (see tools/sim_woled.py). Above ~0.25 strength fringing can get
@@ -271,6 +281,20 @@ static void LoadConfig() {
     c.strength = IniFloat(L"Filter", L"Strength", c.strength);
     c.kernel = IniInt(L"Filter", L"Kernel", c.kernel);
     c.linear = IniInt(L"Filter", L"LinearLight", c.linear);
+    c.ctCancel = IniInt(L"Filter", L"ClearTypeCancel", c.ctCancel) ? 1 : 0;
+    c.ctQ0 = IniFloat(L"Filter", L"CTCancelQ0", c.ctQ0);
+    c.ctQ1 = IniFloat(L"Filter", L"CTCancelQ1", c.ctQ1);
+    c.ctLuma = IniFloat(L"Filter", L"CTCancelLumaRange", c.ctLuma);
+    c.ctRough0 = IniFloat(L"Filter", L"CTCancelRough0", c.ctRough0);
+    c.ctRough1 = IniFloat(L"Filter", L"CTCancelRough1", c.ctRough1);
+    c.ctAmount = IniFloat(L"Filter", L"CTCancelAmount", c.ctAmount);
+    c.ctQ0 = std::min(std::max(c.ctQ0, 0.0f), 1.9f);
+    c.ctQ1 = std::min(std::max(c.ctQ1, c.ctQ0 + 0.01f), 2.0f);
+    c.ctLuma = std::min(std::max(c.ctLuma, 0.05f), 1.0f);
+    c.ctRough0 = std::min(std::max(c.ctRough0, 0.3f), 2.9f);
+    c.ctRough1 = std::min(std::max(c.ctRough1, c.ctRough0 + 0.01f), 3.0f);
+    c.ctAmount = std::min(std::max(c.ctAmount, 0.0f), 1.0f);
+    c.woled = IniInt(L"Subpixel", L"Woled", NameIsWoled(c.preset) ? 1 : 0) != 0;
     // On first run, pick ClearType mode from the Windows setting
     c.cleartype = IniInt(L"Filter", L"ClearTypeMode", firstRun ? (DetectClearType() ? 1 : 0) : 0);
     c.kernel = NormalizeKernel(c.kernel);
@@ -300,13 +324,24 @@ static void SaveConfig() {
     IniPutI(L"Filter", L"Kernel", c.kernel);
     IniPutI(L"Filter", L"LinearLight", c.linear);
     IniPutI(L"Filter", L"ClearTypeMode", c.cleartype);
+    IniPutI(L"Filter", L"ClearTypeCancel", c.ctCancel);
+    IniPutF(L"Filter", L"CTCancelQ0", c.ctQ0);
+    IniPutF(L"Filter", L"CTCancelQ1", c.ctQ1);
+    IniPutF(L"Filter", L"CTCancelLumaRange", c.ctLuma);
+    IniPutF(L"Filter", L"CTCancelRough0", c.ctRough0);
+    IniPutF(L"Filter", L"CTCancelRough1", c.ctRough1);
+    IniPutF(L"Filter", L"CTCancelAmount", c.ctAmount);
+    IniPutI(L"Subpixel", L"Woled", c.woled ? 1 : 0);
 }
 
 // ---- presets: built-in ones + [Preset:Name] sections in the INI
 
 static void LoadPresets() {
     g_presets.clear();
-    for (const auto& p : kBuiltinPresets) g_presets.push_back(p);
+    for (const auto& p : kBuiltinPresets) {
+        g_presets.push_back(p);
+        g_presets.back().woled = NameIsWoled(p.name.c_str());
+    }
     std::vector<wchar_t> buf(65536);
     DWORD n = GetPrivateProfileSectionNamesW(buf.data(), (DWORD)buf.size(), g_iniPath);
     for (wchar_t* s = buf.data(); n && *s; s += wcslen(s) + 1) {
@@ -319,6 +354,7 @@ static void LoadPresets() {
         p.strength = IniFloat(s, L"Strength", 1.0f);
         p.kernel = IniInt(s, L"Kernel", K_CATMULL);
         p.kernel = NormalizeKernel(p.kernel);
+        p.woled = IniInt(s, L"Woled", NameIsWoled(p.name.c_str()) ? 1 : 0) != 0;
         g_presets.push_back(p);
     }
 }
@@ -335,6 +371,7 @@ static void WriteUserPreset(const std::wstring& name, const Config& c) {
         for (int a = 0; a < 2; a++) IniPutF(sec.c_str(), kChKeys[ch][a], c.off[ch][a]);
     IniPutF(sec.c_str(), L"Strength", c.strength);
     IniPutI(sec.c_str(), L"Kernel", c.kernel);
+    IniPutI(sec.c_str(), L"Woled", c.woled ? 1 : 0);
 }
 
 static void DeleteUserPreset(const std::wstring& name) {
@@ -431,37 +468,19 @@ static int PickOutput(const std::vector<OutInfo>& v, int want) {
 
 // ---------------------------------------------------------------- filter weights
 
-static void KernelWeights(float t, int kind, float w[4]) {
-    // taps: floor(position) + (-1, 0, 1, 2). Mitchell-Netravali bicubic with parameters (B, C):
-    // B adds smoothing (less fringing, softer), C sharpens.
-    float B = 0.0f, C = 0.5f;                       // Sharp: Catmull-Rom
-    if (kind == K_BALANCED) { B = 0.2f; C = 0.6f; }
-    else if (kind == K_SMOOTH) { B = 0.3f; C = 0.5f; }
-    auto k = [&](float x) {
-        x = fabsf(x);
-        if (x < 1) return ((12 - 9 * B - 6 * C) * x * x * x + (-18 + 12 * B + 6 * C) * x * x + (6 - 2 * B)) / 6;
-        if (x < 2) return ((-B - 6 * C) * x * x * x + (6 * B + 30 * C) * x * x + (-12 * B - 48 * C) * x + (8 * B + 24 * C)) / 6;
-        return 0.0f;
-    };
-    w[0] = k(t + 1); w[1] = k(t); w[2] = k(1 - t); w[3] = k(2 - t);
-    float s = w[0] + w[1] + w[2] + w[3];
-    for (int i = 0; i < 4; i++) w[i] /= s;
-}
-
-static void ChannelTaps(float d, int kind, int& base, float w[4]) {
-    if (d < -2) d = -2;
-    if (d > 2) d = 2;
-    float fl = floorf(d);
-    base = (int)fl - 1;
-    KernelWeights(d - fl, kind, w);
-}
-
 struct alignas(16) CBData {
     int base[3][4];
     float wx[3][4];
     float wy[3][4];
     int size[4];
     int tile[4];
+};
+
+struct alignas(16) CTData {
+    float gate[4];   // q0, q1, luma range, amount
+    float rough[4];  // r0, r1, invWhite, unused
+    int mode[4];     // decode sRGB input, encode sRGB output, BGR ClearType, scRGB
+    int size[4];     // width - 1, height - 1
 };
 
 // ---------------------------------------------------------------- shaders
@@ -498,6 +517,70 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target {
     // HDR / Advanced Color desktops are scRGB (linear, FP16): values above 1 and below 0 are valid
     if (tileInfo.y != 0) return float4(r, g, b, 1.0);
     return float4(saturate(float3(r, g, b)), 1.0);
+}
+
+// Optional first pass (WOLED, experimental): removes the colour ClearType adds to grey/white/black text so that
+// the channel shifts of PSMain act on a (nearly) greyscale-antialiased image. A pixel is only touched when all
+// three gates agree it is ClearType text: the colour cancels along the row, the window has text-like luma
+// contrast, and the 3x-rate subpixel signal is smooth. The result keeps each pixel's exact luminance.
+cbuffer CTCB : register(b1) {
+    float4 ctGate;   // x = q0 (0.50), y = q1 (0.80), z = lumaRange lr0 (0.25), w = amount (1.0)
+    float4 ctRough;  // x = r0 (1.00), y = r1 (1.30), z = invWhite (always 1: 8-bit capture only), w = unused
+    int4   ctMode;   // x = input is sRGB-encoded (decode it), y = encode output to sRGB, z = BGR ClearType, w = scRGB (no saturate)
+    int4   ctSize;   // x = width - 1, y = height - 1
+};
+
+static const float3 LW = float3(0.2126, 0.7152, 0.0722);
+
+float3 SrgbToLin(float3 e) { return e <= 0.04045 ? e / 12.92 : pow((e + 0.055) / 1.055, 2.4); }
+float3 LinToSrgb(float3 l) { l = max(l, 0); return l <= 0.0031308 ? l * 12.92 : 1.055 * pow(l, 1.0 / 2.4) - 0.055; }
+float  Ramp(float e0, float e1, float x) { return smoothstep(e0, e1, x); }
+
+float4 PSCancel(float4 pos : SV_Position) : SV_Target {
+    int2 p = int2(pos.xy);
+    float3 c[7];
+    float  Y[7];
+    float3 Cm = 0;
+    float  A = 0, Lmin = 1e9, Lmax = -1e9;
+    [unroll] for (int i = 0; i < 7; i++) {
+        int2 q = int2(clamp(p.x + i - 3, 0, ctSize.x), p.y);           // edge clamp = replicate border pixel
+        float3 v = tex.Load(int3(q, 0)).rgb;
+        if (ctMode.x != 0) v = SrgbToLin(v);                             // 10-bit / gamma path: decode first
+        c[i] = v;
+        Y[i] = dot(v, LW);
+        float3 C = v - Y[i];
+        Cm += C;
+        A += length(C);
+        float L = pow(saturate(Y[i] * ctRough.z), 1.0 / 2.2);            // perceptual luma, SDR-white normalised
+        Lmin = min(Lmin, L);
+        Lmax = max(Lmax, L);
+    }
+    Cm /= 7.0;
+    A /= 7.0;
+    // 1) ClearType colour of grey text cancels along the row: |mean C| << mean |C|
+    float g = 1.0 - Ramp(ctGate.x, ctGate.y, length(Cm) / (A + 1e-4 / ctRough.z));
+    // 2) text-like luma contrast in the window
+    g *= Ramp(ctGate.z, 2.0 * ctGate.z, Lmax - Lmin);
+    // 3) the 3x-rate subpixel signal (R0 G0 B0 R1 ...) is smooth for ClearType, jagged for coloured UI / photos
+    if (g > 0.0) {
+        float3 e0 = LinToSrgb(saturate(c[1] * ctRough.z)), e1 = LinToSrgb(saturate(c[2] * ctRough.z)),
+               e2 = LinToSrgb(saturate(c[3] * ctRough.z)), e3 = LinToSrgb(saturate(c[4] * ctRough.z)),
+               e4 = LinToSrgb(saturate(c[5] * ctRough.z));
+        if (ctMode.z != 0) { e0 = e0.bgr; e1 = e1.bgr; e2 = e2.bgr; e3 = e3.bgr; e4 = e4.bgr; }
+        float s[11] = {e0.b, e1.r, e1.g, e1.b, e2.r, e2.g, e2.b, e3.r, e3.g, e3.b, e4.r};
+        float D1 = 0, D2 = 0;
+        [unroll] for (int k = 1; k <= 9; k++) {
+            D1 += abs(s[k] - s[k - 1]);
+            D2 += abs(s[k + 1] - 2.0 * s[k] + s[k - 1]);
+        }
+        g *= 1.0 - Ramp(ctRough.x, ctRough.y, D2 / (D1 + 3e-3));
+    }
+    g *= ctGate.w;
+    // Desaturate toward the pixel's own luminance: Y is exact and the result is a convex mix of the pixel and
+    // a grey of the same luminance, so it never leaves [0,1] (SDR) and never adds negative scRGB values.
+    float3 o = lerp(c[3], Y[3].xxx, g);
+    if (ctMode.y != 0) o = LinToSrgb(saturate(o));
+    return float4(o, 1.0);
 }
 )HLSL";
 
@@ -581,6 +664,14 @@ struct Renderer {
     Com<ID3D11VertexShader> vs;
     Com<ID3D11PixelShader> ps;
     Com<ID3D11Buffer> cb;
+    // optional ClearType colour-removal pre-pass (WOLED, experimental); resources are created on first use
+    Com<ID3D11PixelShader> psCt;
+    Com<ID3D11Buffer> cbCt;
+    Com<ID3D11Texture2D> ctTex;
+    Com<ID3D11ShaderResourceView> ctSrv;
+    Com<ID3D11RenderTargetView> ctRtv;
+    bool ctFailed = false;   // creating the pre-pass resources failed: stay off until the size or device changes
+    bool lastCtOn = false;   // the last drawn frame used the pre-pass (widens the cross-adapter copy margin)
     UINT w = 0, h = 0;
     bool haveFrame = false;
     std::vector<uint8_t> meta;
@@ -630,6 +721,10 @@ struct Renderer {
         accFull = true;
         maskSrv.reset();
         maskTex.reset();
+        ctRtv.reset();
+        ctSrv.reset();
+        ctTex.reset();
+        ctFailed = false;
         tw = th = 0;
     }
 
@@ -646,6 +741,8 @@ struct Renderer {
         dc.reset();
         sc.reset();
         cb.reset();
+        cbCt.reset();
+        psCt.reset();
         ps.reset();
         vs.reset();
         out1.reset();
@@ -676,6 +773,13 @@ struct Renderer {
         if (!compile(kShader, sizeof(kShader) - 1, "PSMain", "ps_5_0", psb)) return false;
         if (FAILED(dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, vs.put()))) return false;
         if (FAILED(dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, ps.put()))) return false;
+        // The ClearType pre-pass is optional: if it does not compile, the filter still works without it
+        Com<ID3DBlob> ctb;
+        if (compile(kShader, sizeof(kShader) - 1, "PSCancel", "ps_5_0", ctb) &&
+            SUCCEEDED(dev->CreatePixelShader(ctb->GetBufferPointer(), ctb->GetBufferSize(), nullptr, psCt.put())))
+            ;
+        else
+            psCt.reset();
         return true;
     }
 
@@ -760,6 +864,8 @@ struct Renderer {
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         if (FAILED(dev->CreateBuffer(&bd, nullptr, cb.put()))) return false;
+        bd.ByteWidth = sizeof(CTData);
+        if (FAILED(dev->CreateBuffer(&bd, nullptr, cbCt.put()))) cbCt.reset();
 
         // DirectComposition: always on the monitor's GPU (cross-adapter presentation flickers)
         static HMODULE dcompDll = LoadLibraryW(L"dcomp.dll");
@@ -1057,9 +1163,38 @@ struct Renderer {
         return any;
     }
 
+    // FP16 target for the ClearType pre-pass, created lazily so QD-OLED users never pay the memory
+    bool EnsureCt() {
+        if (ctTex && ctSrv && ctRtv) return true;
+        if (ctFailed || !psCt || !cbCt) return false;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, ctTex.put())) ||
+            FAILED(dev->CreateShaderResourceView(ctTex.get(), nullptr, ctSrv.put())) ||
+            FAILED(dev->CreateRenderTargetView(ctTex.get(), nullptr, ctRtv.put()))) {
+            ctRtv.reset();
+            ctSrv.reset();
+            ctTex.reset();
+            ctFailed = true;
+            Log("ClearType pre-pass: could not create the FP16 target, feature off");
+            return false;
+        }
+        return true;
+    }
+
     void Render() {
         Config c = GetCfg();
         bool bypass = g_bypass.load();
+        // pre-pass only for WOLED layouts, 8-bit capture (HDR/10-bit untested), and when the user turned it on
+        bool ctOn = !bypass && c.ctCancel && c.woled && capFmt == DXGI_FORMAT_B8G8R8A8_UNORM && EnsureCt();
+        lastCtOn = ctOn;
         CBData d{};
         for (int ch = 0; ch < 3; ch++) {
             if (bypass) {
@@ -1071,7 +1206,7 @@ struct Renderer {
                 // ClearType-compatible mode: ClearType already draws red shifted by -1/3 px and blue by +1/3 px
                 // (reversed for BGR). Required shift = panel position - position ClearType assumes.
                 float ct = 0;
-                if (c.cleartype && ch != 1) ct = ((ch == 0) != g_ctBGR.load()) ? -1.0f / 3 : 1.0f / 3;
+                if (c.cleartype && !ctOn && ch != 1) ct = ((ch == 0) != g_ctBGR.load()) ? -1.0f / 3 : 1.0f / 3;
                 ChannelTaps((c.off[ch][0] - ct) * c.strength, c.kernel, d.base[ch][0], d.wx[ch]);
                 ChannelTaps(c.off[ch][1] * c.strength, c.kernel, d.base[ch][1], d.wy[ch]);
             }
@@ -1092,11 +1227,36 @@ struct Renderer {
         ID3D11RenderTargetView* rt = lin ? views[1].get() : views[0].get();
         ID3D11ShaderResourceView* sv = srv[cur][lin ? 1 : 0].get();
         D3D11_VIEWPORT vp{0, 0, (float)w, (float)h, 0, 1};
-        ctx->OMSetRenderTargets(1, &rt, nullptr);
         ctx->RSSetViewports(1, &vp);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->IASetInputLayout(nullptr);
         ctx->VSSetShader(vs.get(), nullptr, 0);
+        if (ctOn) {
+            // pass 1: remove ClearType colour; output is in the same space the main pass expects (linear when it
+            // reads the sRGB view, sRGB-encoded otherwise), so the main pass only reads ctSrv instead of the capture
+            CTData t{};
+            t.gate[0] = c.ctQ0; t.gate[1] = c.ctQ1; t.gate[2] = c.ctLuma; t.gate[3] = c.ctAmount;
+            t.rough[0] = c.ctRough0; t.rough[1] = c.ctRough1; t.rough[2] = 1.0f;
+            t.mode[0] = t.mode[1] = lin ? 0 : 1;
+            t.mode[2] = g_ctBGR.load() ? 1 : 0;
+            t.size[0] = (int)w - 1; t.size[1] = (int)h - 1;
+            D3D11_MAPPED_SUBRESOURCE mc;
+            if (SUCCEEDED(ctx->Map(cbCt.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mc))) {
+                memcpy(mc.pData, &t, sizeof t);
+                ctx->Unmap(cbCt.get(), 0);
+            }
+            ID3D11RenderTargetView* crt = ctRtv.get();
+            ctx->OMSetRenderTargets(1, &crt, nullptr);
+            ctx->PSSetShader(psCt.get(), nullptr, 0);
+            ID3D11Buffer* b1 = cbCt.get();
+            ctx->PSSetConstantBuffers(1, 1, &b1);
+            ctx->PSSetShaderResources(0, 1, &sv);
+            ctx->Draw(3, 0);
+            ID3D11ShaderResourceView* none1 = nullptr;
+            ctx->PSSetShaderResources(0, 1, &none1);
+            sv = ctSrv.get();
+        }
+        ctx->OMSetRenderTargets(1, &rt, nullptr);
         ctx->PSSetShader(ps.get(), nullptr, 0);
         ID3D11Buffer* b = cb.get();
         ctx->PSSetConstantBuffers(0, 1, &b);
@@ -1113,7 +1273,7 @@ struct Renderer {
     // Cross mode: move changed regions (grown by the filter reach) to the display GPU
     bool TransferToDisplay() {
         std::vector<RECT> list;
-        const LONG M = 6;  // the filter samples at most ~4 px away
+        const LONG M = lastCtOn ? 10 : 6;  // the filter samples at most ~4 px away (+3 px for the ClearType pre-pass)
         if (accFull) {
             list.push_back(RECT{0, 0, (LONG)w, (LONG)h});
         } else {
@@ -1447,6 +1607,7 @@ static void ApplyPreset(int i) {
         memcpy(c.off, p.off, sizeof c.off);
         c.strength = p.strength;
         c.kernel = p.kernel;
+        c.woled = p.woled;
         wcsncpy(c.preset, p.name.c_str(), 63);
         c.preset[63] = 0;
     });
@@ -1471,29 +1632,6 @@ static const wchar_t* kReleasesPage = L"https://github.com/oguz463/OLEDTextFix/r
 enum UpdState { UPD_IDLE = 0, UPD_BUSY, UPD_UPTODATE, UPD_READY, UPD_MANUAL, UPD_FAILED };
 static std::atomic<int> g_updState{UPD_IDLE};
 static wchar_t g_updVer[40];
-
-static bool ParseVersion(const char* s, std::vector<int>& v) {
-    v.clear();
-    if (*s == 'v' || *s == 'V') s++;
-    if (!isdigit((unsigned char)*s)) return false;
-    while (*s) {
-        if (!isdigit((unsigned char)*s)) break;
-        int n = 0;
-        while (isdigit((unsigned char)*s) && n < 100000) n = n * 10 + (*s++ - '0');
-        v.push_back(n);
-        if (*s != '.') break;
-        s++;
-    }
-    return !v.empty();
-}
-static bool IsNewerVersion(const char* tag, const char* cur) {
-    std::vector<int> a, b;
-    if (!ParseVersion(tag, a) || !ParseVersion(cur, b)) return false;
-    size_t n = std::max(a.size(), b.size());
-    a.resize(n, 0);
-    b.resize(n, 0);
-    return std::lexicographical_compare(b.begin(), b.end(), a.begin(), a.end());
-}
 
 static bool HttpGet(const wchar_t* host, const std::wstring& path, std::string& out, size_t maxBytes) {
     out.clear();
@@ -1738,7 +1876,7 @@ static void HandleTrayCommand(UINT id) {
 enum {
     IDC_ENABLED = 1001, IDC_COMPARE, IDC_LINEAR, IDC_CLEARTYPE, IDC_SUSPEND, IDC_AUTOSTART,
     IDC_MONITOR, IDC_PRESET, IDC_DELETE, IDC_NAME, IDC_SAVEAS, IDC_KERNEL,
-    IDC_SAVE, IDC_DEFAULTS, IDC_CLOSE, IDC_GPU, IDC_FPSCAP, IDC_OPAQUE, IDC_MOTION, IDC_HDR, IDC_SLIDER0 = 1100,
+    IDC_SAVE, IDC_DEFAULTS, IDC_CLOSE, IDC_GPU, IDC_FPSCAP, IDC_OPAQUE, IDC_MOTION, IDC_HDR, IDC_CTCANCEL, IDC_SLIDER0 = 1100,
 };
 
 static const int kSliders = 7;  // 0..5: RX RY GX GY BX BY, 6: strength
@@ -1746,7 +1884,7 @@ static const wchar_t* kSliderNames[kSliders] = {L"Red  X", L"Red  Y", L"Green  X
 
 struct SettingsUI {
     HWND wnd = nullptr, pattern = nullptr;
-    HWND hdrGeneral, chkEnabled, chkCompare, chkLinear, chkCT, lblCT, chkSuspend, chkAutostart, lblMon, cmbMon;
+    HWND hdrGeneral, chkEnabled, chkCompare, chkLinear, chkCT, lblCT, chkCtCancel, lblCtCancel, chkSuspend, chkAutostart, lblMon, cmbMon;
     HWND hdrPreset, cmbPreset, btnDelete, edtName, btnSaveAs;
     HWND hdrSub, lblSl[kSliders], sl[kSliders], val[kSliders], lblKernel, cmbKernel;
     HWND hdrPerf, lblGpu, cmbGpu, lblFps, cmbFps, chkOpaque, chkMotion, chkHdr;
@@ -1782,6 +1920,14 @@ static void UpdateClearTypeLabel() {
     swprintf(b, 200, L"Windows ClearType: %ls%ls", on ? (bgr ? L"on (BGR)" : L"on (RGB)") : L"off / grayscale",
              on != mode ? L"  ⚠ does not match this checkbox" : L"  ✓ matches");
     SetWindowTextW(g_ui.lblCT, b);
+
+    // ClearType colour removal: only meaningful on WOLED presets with ClearType text
+    Config c = GetCfg();
+    const wchar_t* st = !c.ctCancel   ? L"Off (experimental, WOLED presets only)"
+                        : !c.woled    ? L"On, but inactive: the selected preset is not a WOLED layout"
+                        : !on         ? L"On, but Windows ClearType is off: nothing to remove"
+                                      : L"Active: ClearType colour on grey text is removed before the correction";
+    SetWindowTextW(g_ui.lblCtCancel, st);
 }
 
 static void FillPresetCombo() {
@@ -1828,6 +1974,7 @@ static void SyncControls() {
     chk(g_ui.chkMotion, c.motionBypass);
     chk(g_ui.chkOpaque, c.overlayAlpha >= 255);
     chk(g_ui.chkHdr, c.hdr);
+    chk(g_ui.chkCtCancel, c.ctCancel);
     FillPresetCombo();
     UpdateClearTypeLabel();
     g_ui.syncing = false;
@@ -1873,6 +2020,8 @@ static void Layout() {
     Place(g_ui.chkLinear, x, y, w, rh); y += rh;
     Place(g_ui.chkCT, x, y, w, rh); y += rh;
     Place(g_ui.lblCT, x + S(20), y, w - S(20), S(18)); y += S(22);
+    Place(g_ui.chkCtCancel, x, y, w, rh); y += rh;
+    Place(g_ui.lblCtCancel, x + S(20), y, w - S(20), S(18)); y += S(22);
     Place(g_ui.chkSuspend, x, y, w, rh); y += rh;
     Place(g_ui.chkAutostart, x, y, w, rh); y += rh + S(6);
     Place(g_ui.lblMon, x, y + S(4), S(kLabelW), S(20));
@@ -1916,7 +2065,7 @@ static void Layout() {
     Place(g_ui.pattern, px, 0, std::max(10, (int)rc.right - px), rc.bottom);
 }
 
-static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 935;
+static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 975;
 
 static void ResizeForDpi() {
     RECT r{0, 0, S(kClientW), S(kClientH)};
@@ -1932,6 +2081,8 @@ static void CreateControls() {
     g_ui.chkLinear = Mk(L"BUTTON", L"Process in linear light (recommended)", CB, IDC_LINEAR);
     g_ui.chkCT = Mk(L"BUTTON", L"ClearType-compatible mode (check if ClearType is on)", CB, IDC_CLEARTYPE);
     g_ui.lblCT = Mk(L"STATIC", L"", 0, 0);
+    g_ui.chkCtCancel = Mk(L"BUTTON", L"Remove ClearType colour fringes (WOLED, experimental)", BS_AUTOCHECKBOX | WS_TABSTOP, IDC_CTCANCEL);
+    g_ui.lblCtCancel = Mk(L"STATIC", L"", 0, 0);
     g_ui.chkSuspend = Mk(L"BUTTON", L"Pause for fullscreen games/video", CB, IDC_SUSPEND);
     g_ui.chkAutostart = Mk(L"BUTTON", L"Start with Windows", CB, IDC_AUTOSTART);
     g_ui.lblMon = Mk(L"STATIC", L"Monitor:", 0, 0);
@@ -2151,6 +2302,11 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                     break;
                 case IDC_MOTION: EditCfg([&](Config& c) { c.motionBypass = checked(g_ui.chkMotion); }); Changed(); break;
                 case IDC_HDR: EditCfg([&](Config& c) { c.hdr = checked(g_ui.chkHdr); }); g_restart = true; break;
+                case IDC_CTCANCEL:
+                    EditCfg([&](Config& c) { c.ctCancel = checked(g_ui.chkCtCancel); });
+                    UpdateClearTypeLabel();
+                    Changed();
+                    break;
                 case IDC_OPAQUE: {
                     int a = checked(g_ui.chkOpaque) ? 255 : 254;
                     EditCfg([&](Config& c) { c.overlayAlpha = a; });
