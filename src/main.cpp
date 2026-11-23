@@ -122,6 +122,7 @@ struct Config {
     // [channel R,G,B][x,y]   (y positive downwards)
     float off[3][2] = {{-0.22f, 0.50f}, {0.0f, 0.0f}, {0.27f, 0.52f}};
     float strength = 0.90f;
+    float strengthY = 1.0f;    // vertical strength (strength = horizontal); QD-OLED presets 1.0, WOLED presets follow strength
     // Experimental: shifts all three channels together (the luminance), in pixels, for panels whose white subpixel
     // moves the brightness away from the colour centroid. 0 = off. Not part of presets.
     float lumX = 0.0f, lumY = 0.0f;
@@ -163,6 +164,7 @@ struct Preset {
     int kernel;
     bool builtin;
     bool woled = false;
+    float strengthY = -1.0f;  // < 0: derived (QD-OLED 1.0, WOLED = strength)
 };
 
 
@@ -334,6 +336,7 @@ static void LoadConfig() {
     c.ctRough1 = std::min(std::max(c.ctRough1, c.ctRough0 + 0.01f), 3.0f);
     c.ctAmount = std::min(std::max(c.ctAmount, 0.0f), 1.0f);
     c.woled = IniInt(L"Subpixel", L"Woled", NameIsWoled(c.preset) ? 1 : 0) != 0;
+    c.strengthY = IniFloat(L"Filter", L"StrengthY", c.woled ? c.strength : 1.0f);
     // On first run, pick ClearType mode from the Windows setting
     c.cleartype = IniInt(L"Filter", L"ClearTypeMode", firstRun ? (DetectClearType() ? 1 : 0) : 0);
     c.kernel = NormalizeKernel(c.kernel);
@@ -360,6 +363,7 @@ static void SaveConfig() {
     for (int ch = 0; ch < 3; ch++)
         for (int a = 0; a < 2; a++) IniPutF(L"Subpixel", kChKeys[ch][a], c.off[ch][a]);
     IniPutF(L"Filter", L"Strength", c.strength);
+    IniPutF(L"Filter", L"StrengthY", c.strengthY);
     IniPutI(L"Filter", L"FlatSkip", c.flatSkip);
     IniPutF(L"Filter", L"LumShiftX", c.lumX);
     IniPutF(L"Filter", L"LumShiftY", c.lumY);
@@ -394,6 +398,7 @@ static void LoadPresets() {
         for (int ch = 0; ch < 3; ch++)
             for (int a = 0; a < 2; a++) p.off[ch][a] = IniFloat(s, kChKeys[ch][a], 0);
         p.strength = IniFloat(s, L"Strength", 1.0f);
+        p.strengthY = IniFloat(s, L"StrengthY", -1.0f);
         p.kernel = IniInt(s, L"Kernel", K_CATMULL);
         p.kernel = NormalizeKernel(p.kernel);
         p.woled = IniInt(s, L"Woled", NameIsWoled(p.name.c_str()) ? 1 : 0) != 0;
@@ -407,11 +412,20 @@ static int FindPreset(const wchar_t* name) {
     return -1;
 }
 
+// Separate vertical strength: only offered (and used) for QD-OLED layouts and for custom settings. The built-in
+// WOLED presets have no vertical offsets, so one strength is enough there.
+static bool StrengthYShown(const Config& c) {
+    if (!c.woled) return true;
+    int i = FindPreset(c.preset);
+    return i < 0 || !g_presets[i].builtin;
+}
+
 static void WriteUserPreset(const std::wstring& name, const Config& c) {
     std::wstring sec = L"Preset:" + name;
     for (int ch = 0; ch < 3; ch++)
         for (int a = 0; a < 2; a++) IniPutF(sec.c_str(), kChKeys[ch][a], c.off[ch][a]);
     IniPutF(sec.c_str(), L"Strength", c.strength);
+    IniPutF(sec.c_str(), L"StrengthY", c.strengthY);
     IniPutI(sec.c_str(), L"Kernel", c.kernel);
     IniPutI(sec.c_str(), L"Woled", c.woled ? 1 : 0);
 }
@@ -1483,7 +1497,7 @@ struct Renderer {
                 float ct = 0;
                 if (c.cleartype && !ctOn && ch != 1) ct = ((ch == 0) != g_ctBGR.load()) ? -1.0f / 3 : 1.0f / 3;
                 ChannelTaps((c.off[ch][0] - ct) * c.strength + lumX, c.kernel, d.base[ch][0], d.wx[ch]);
-                ChannelTaps(c.off[ch][1] * c.strength + lumY, c.kernel, d.base[ch][1], d.wy[ch]);
+                ChannelTaps(c.off[ch][1] * (StrengthYShown(c) ? c.strengthY : c.strength) + lumY, c.kernel, d.base[ch][1], d.wy[ch]);
             }
         }
         d.size[0] = (int)w - 1;
@@ -1975,6 +1989,7 @@ static void ApplyPreset(int i) {
     EditCfg([&](Config& c) {
         memcpy(c.off, p.off, sizeof c.off);
         c.strength = p.strength;
+        c.strengthY = p.strengthY >= 0 ? p.strengthY : (p.woled ? p.strength : 1.0f);  // QD-OLED: X 0.90, Y 1.00
         c.lumX = c.lumY = 0.0f;  // the luminance shift is not stored in presets
         c.kernel = p.kernel;
         c.woled = p.woled;
@@ -2249,8 +2264,8 @@ enum {
     IDC_SAVE, IDC_DEFAULTS, IDC_CLOSE, IDC_GPU, IDC_FPSCAP, IDC_OPAQUE, IDC_MOTION, IDC_HDR, IDC_CTCANCEL, IDC_SLIDER0 = 1100,
 };
 
-static const int kSliders = 9;  // 0..5: RX RY GX GY BX BY, 6: strength, 7..8: luminance shift X Y
-static const wchar_t* kSliderNames[kSliders] = {L"Red  X", L"Red  Y", L"Green  X", L"Green  Y", L"Blue  X", L"Blue  Y", L"Strength", L"Luma X (WOLED)", L"Luma Y (WOLED)"};
+static const int kSliders = 10;  // 0..5: RX RY GX GY BX BY, 6..7: strength X Y, 8..9: luminance shift X Y
+static const wchar_t* kSliderNames[kSliders] = {L"Red  X", L"Red  Y", L"Green  X", L"Green  Y", L"Blue  X", L"Blue  Y", L"Strength X", L"Strength Y", L"Luma X (WOLED)", L"Luma Y (WOLED)"};
 
 struct SettingsUI {
     HWND wnd = nullptr, pattern = nullptr;
@@ -2276,8 +2291,8 @@ static void UpdateSliderLabel(int i) {
     if (!g_ui.wnd) return;
     int pos = (int)SendMessageW(g_ui.sl[i], TBM_GETPOS, 0, 0);
     wchar_t b[32];
-    if (i < 6 || i >= 7) swprintf(b, 32, L"%+.2f px", pos / 100.0);
-    else swprintf(b, 32, L"%.2f", pos / 100.0);
+    if (i == 6 || i == 7) swprintf(b, 32, L"%.2f", pos / 100.0);
+    else swprintf(b, 32, L"%+.2f px", pos / 100.0);
     SetWindowTextW(g_ui.val[i], b);
 }
 
@@ -2315,6 +2330,7 @@ static void FillPresetCombo() {
     EnableWindow(g_ui.btnDelete, sel > 0 && !g_presets[sel - 1].builtin);
 }
 
+static void UpdateStrengthRows();
 static void SyncControls() {
     if (!g_ui.wnd) return;
     g_ui.syncing = true;
@@ -2329,10 +2345,11 @@ static void SyncControls() {
     for (int i = 0; i < 6; i++)
         SendMessageW(g_ui.sl[i], TBM_SETPOS, TRUE, (LPARAM)lroundf(c.off[i / 2][i % 2] * 100));
     SendMessageW(g_ui.sl[6], TBM_SETPOS, TRUE, (LPARAM)lroundf(c.strength * 100));
-    SendMessageW(g_ui.sl[7], TBM_SETPOS, TRUE, (LPARAM)lroundf(c.lumX * 100));
-    SendMessageW(g_ui.sl[8], TBM_SETPOS, TRUE, (LPARAM)lroundf(c.lumY * 100));
+    SendMessageW(g_ui.sl[7], TBM_SETPOS, TRUE, (LPARAM)lroundf(c.strengthY * 100));
+    SendMessageW(g_ui.sl[8], TBM_SETPOS, TRUE, (LPARAM)lroundf(c.lumX * 100));
+    SendMessageW(g_ui.sl[9], TBM_SETPOS, TRUE, (LPARAM)lroundf(c.lumY * 100));
     for (int i = 0; i < kSliders; i++) UpdateSliderLabel(i);
-    for (int i = 7; i < 9; i++) {  // the luminance shift only applies to WOLED layouts
+    for (int i = 8; i < kSliders; i++) {  // the luminance shift only applies to WOLED layouts
         EnableWindow(g_ui.sl[i], c.woled);
         EnableWindow(g_ui.lblSl[i], c.woled);
         EnableWindow(g_ui.val[i], c.woled);
@@ -2354,13 +2371,28 @@ static void SyncControls() {
     chk(g_ui.chkCtCancel, c.ctCancel);
     FillPresetCombo();
     UpdateClearTypeLabel();
+    UpdateStrengthRows();
     g_ui.syncing = false;
+}
+
+static void Layout();
+static bool g_showY = true;  // the Strength Y row is visible
+static void UpdateStrengthRows() {
+    if (!g_ui.wnd) return;
+    bool show = StrengthYShown(GetCfg());
+    SetWindowTextW(g_ui.lblSl[6], show ? L"Strength X" : L"Strength");
+    if (show != g_showY) {
+        g_showY = show;
+        for (HWND h : {g_ui.lblSl[7], g_ui.sl[7], g_ui.val[7]}) ShowWindow(h, show ? SW_SHOW : SW_HIDE);
+        Layout();
+    }
 }
 
 static void MarkCustom() {
     EditCfg([](Config& c) { c.preset[0] = 0; });
     SendMessageW(g_ui.cmbPreset, CB_SETCURSEL, 0, 0);
     EnableWindow(g_ui.btnDelete, FALSE);
+    UpdateStrengthRows();
 }
 
 static HWND Mk(const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD ex = 0) {
@@ -2412,7 +2444,8 @@ static void Layout() {
 
     Place(g_ui.hdrSub, x, y, w, S(20)); y += S(24);
     for (int i = 0; i < kSliders; i++) {
-        if (i == 6) y += S(6);
+        if (i == 6 || i == 8) y += S(6);
+        if (i == 7 && !g_showY) continue;
         Place(g_ui.lblSl[i], x, y + S(5), S(kLabelW), S(20));
         Place(g_ui.sl[i], x + S(kLabelW + 2), y, w - S(kLabelW + 2 + 66), S(28));
         Place(g_ui.val[i], x + w - S(62), y + S(5), S(62), S(20));
@@ -2442,7 +2475,7 @@ static void Layout() {
     Place(g_ui.pattern, px, 0, std::max(10, (int)rc.right - px), rc.bottom);
 }
 
-static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 1035;
+static const int kClientW = 14 + kLeftW + 14 + 720, kClientH = 1065;
 
 static void ResizeForDpi() {
     RECT r{0, 0, S(kClientW), S(kClientH)};
@@ -2477,8 +2510,8 @@ static void CreateControls() {
     for (int i = 0; i < kSliders; i++) {
         g_ui.lblSl[i] = Mk(L"STATIC", kSliderNames[i], 0, 0);
         g_ui.sl[i] = Mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_BOTH | TBS_NOTICKS | WS_TABSTOP, IDC_SLIDER0 + i);
-        if (i != 6) SendMessageW(g_ui.sl[i], TBM_SETRANGE, TRUE, MAKELPARAM(-100, 100));
-        else SendMessageW(g_ui.sl[i], TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
+        if (i == 6 || i == 7) SendMessageW(g_ui.sl[i], TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
+        else SendMessageW(g_ui.sl[i], TBM_SETRANGE, TRUE, MAKELPARAM(-100, 100));
         SendMessageW(g_ui.sl[i], TBM_SETLINESIZE, 0, 1);
         SendMessageW(g_ui.sl[i], TBM_SETPAGESIZE, 0, 5);
         g_ui.val[i] = Mk(L"STATIC", L"", SS_RIGHT, 0);
@@ -2612,7 +2645,8 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 EditCfg([&](Config& c) {
                     if (i < 6) c.off[i / 2][i % 2] = v;
                     else if (i == 6) c.strength = v;
-                    else if (i == 7) c.lumX = v;
+                    else if (i == 7) c.strengthY = v;
+                    else if (i == 8) c.lumX = v;
                     else c.lumY = v;
                 });
                 UpdateSliderLabel(i);

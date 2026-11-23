@@ -217,6 +217,14 @@ right values depend on the panel, so tune them by eye with the Compare option. F
 text slightly. Both are 0 by default, are not stored in presets and are reset when a preset is applied. INI keys: `LumShiftX`,
 `LumShiftY` (`[Filter]`, range -1 to 1).
 
+### Strength X / Strength Y
+
+**Strength X** and **Strength Y** scale the horizontal and the vertical subpixel shift separately. They are shown
+for QD-OLED presets and for custom settings; the built-in WOLED presets have no vertical offsets, so they show a
+single **Strength** slider. The QD-OLED presets use Strength X 0.90 and Strength Y 1.00: the vertical shift decides
+the faint halo above and below thin lines. INI keys: `Strength`, `StrengthY` (`[Filter]`; when `StrengthY` is absent
+it is 1.0 for QD-OLED and equal to `Strength` for WOLED). User presets store both values.
+
 ### ClearType colour removal (experimental, 1.2.0)
 
 **Remove ClearType colour fringes (WOLED, experimental)** in Settings adds a first pass that removes
