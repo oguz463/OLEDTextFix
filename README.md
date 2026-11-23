@@ -98,15 +98,14 @@ carries most of the brightness, which keeps text sharp.
 
 | Preset | Red (X, Y) | Blue (X, Y) |
 |---|---|---|
-| 27" 1440p 240/280 Hz | −0.22, +0.50 | +0.27, +0.52 |
-| 27" 1440p 360 Hz (Gen 3, 2024) | −0.22, +0.50 | +0.27, +0.52 |
-| 27" 1440p 500 Hz (2025) | −0.22, +0.50 | +0.27, +0.52 |
-| 27" 4K 240 Hz (Gen 4, 2025) | −0.17, +0.50 | +0.32, +0.50 |
-| 32" 4K 165 Hz | −0.13, +0.50 | +0.37, +0.50 |
-| 32" 4K 240 Hz (Gen 3, 2024) | −0.13, +0.50 | +0.37, +0.50 |
-| 34" 3440x1440 165/175 Hz (Gen 1) | −0.31, +0.49 | +0.22, +0.49 |
-| 34" 3440x1440 240 Hz (Gen 2) | −0.31, +0.49 | +0.22, +0.49 |
-| 49" 5120x1440 144/240 Hz (Gen 2) | −0.18, +0.50 | +0.32, +0.50 |
+| 27" 1440p | −0.22, +0.50 | +0.27, +0.52 |
+| 27" 4K | −0.17, +0.50 | +0.32, +0.50 |
+| 32" 4K | −0.13, +0.50 | +0.37, +0.50 |
+| 34" 3440x1440 | −0.31, +0.49 | +0.22, +0.49 |
+| 49" 5120x1440 | −0.18, +0.50 | +0.32, +0.50 |
+
+Panels of the same size and resolution share one preset (the layout does not change with refresh rate
+or panel generation). Settings saved under an older preset name move to the merged one automatically.
 
 Also included: *Any QD-OLED triad — vertical only* and *QD-OLED legacy estimate*.
 
@@ -200,6 +199,14 @@ around ClearType text on a WOLED is mostly ClearType's own, and shifting channel
 barely changes it (simulated colour error reduced by only 2–10%). Reports from WOLED users are very
 welcome.
 
+### Flat areas are left alone
+
+Areas that are flat or only a smooth gradient (window shadows, backgrounds) have nothing to correct, so the
+overlay leaves them transparent and the real desktop shows through. This keeps window shadows from flickering
+when a neighbouring area changes constantly (a moving graph, for example). `FlatSkip` in the `[Filter]`
+section sets how flat an area must be, in 1/255 steps of colour range inside the filter window (default 5,
+0 = process everything).
+
 ### Luma shift (experimental)
 
 The two **Luma** sliders (WOLED presets only, greyed out otherwise) move all three channels together, in
@@ -219,7 +226,7 @@ neighbourhood has text-like brightness contrast, and the signal at subpixel rate
 touched pixel keeps its exact brightness and loses its colour. Coloured text (links, syntax
 highlighting), icons, photos and video are left alone.
 
-- It is **off by default**, only acts with a WOLED preset and 8-bit desktop capture, and does nothing
+- It is **on by default** (settings you already saved keep their value), only acts with a WOLED preset and 8-bit desktop capture, and does nothing
   when Windows ClearType is off (the status line under the checkbox says which). It does not apply
   to QD-OLED: ClearType's red/blue placement already matches that layout, so removing the colour
   gives no gain there and softens text.
@@ -267,14 +274,13 @@ overlay; try toggling "Fully opaque overlay" or another Processing GPU, and repo
 
 When HDR or Windows 11's **Auto Color Management** (Settings → Display → Advanced display →
 "Automatically manage color for apps") is on, Windows composes the desktop in a 16-bit floating-point
-format (scRGB) instead of 8-bit. The app captures that format directly, resamples it in linear light
-and shows the result in a matching overlay, so the colours are left unchanged.
+format (scRGB) instead of 8-bit.
 
-- **Auto Color Management** is handled automatically. If the status line says the format is
-  unsupported, send the log (`OLEDTextFix.log`) with the line "Unsupported desktop format".
+- **Auto Color Management** is not supported yet: the overlay comes out black or far too dark in this
+  mode, so the app pauses and the status line says so. Turn Auto Color Management off to use the app.
 - **HDR** is experimental: tick *Experimental: process HDR desktops* in Settings. It is off by
-  default and, if it cannot capture, the app pauses as before. HDR content itself (video, games) is
-  processed too, which is unnecessary; only SDR text benefits.
+  default and the app pauses while HDR is on. HDR content itself (video, games) is processed too,
+  which is unnecessary; only SDR text benefits.
 - In these modes the Processing GPU setting is ignored (the monitor's GPU is used) and the
   linear-light option has no effect (the data is already linear).
 - Not verified on a wide range of setups yet. Reports with your GPU, monitor and the log are very
@@ -336,7 +342,7 @@ subpixel. Please share your measurements in [Issues](https://github.com/oguz463/
   hidden" and "Fullscreen pause" lines in `OLEDTextFix.log` show why the overlay was hidden.
 - **"Paused" with HDR on, or the status line mentions the desktop format:** see
   [HDR and Auto Color Management](#hdr-and-auto-color-management). If HDR is off and it still says
-  so, turn "Automatically manage color for apps" off and on again and send the log.
+  so, "Automatically manage color for apps" is on: turn it off.
 - **No visible difference on a WOLED monitor:** check the preset in Settings. On brands other than
   LG the first-run auto-pick cannot tell WOLED from QD-OLED, so it may have chosen a QD-OLED preset
   (the app shows a notification with the choice). Select the matching WOLED preset by hand; WOLED

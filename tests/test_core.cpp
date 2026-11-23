@@ -51,7 +51,7 @@ static void TestWoledNames() {
     CHECK(NameIsWoled(L"27\" 1440p 480 Hz WOLED — RGWB (2024-2025)"));
     CHECK(NameIsWoled(L"Any WOLED — RWBG"));
     CHECK(!NameIsWoled(L"RGB stripe (Tandem RGB WOLED / QD-OLED V-Stripe) — no correction"));
-    CHECK(!NameIsWoled(L"27\" 1440p 240/280 Hz QD-OLED"));
+    CHECK(!NameIsWoled(L"27\" 1440p QD-OLED"));
     CHECK(!NameIsWoled(L"My preset"));
 }
 

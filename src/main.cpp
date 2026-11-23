@@ -117,7 +117,7 @@ static int NormalizeKernel(int k) {
 #endif
 
 struct Config {
-    int monitor = -1;  // -1 = automatic (Samsung first, then primary)
+    int monitor = -1;  // -1 = automatic (the primary display)
     // Physical position of each channel's subpixel relative to the pixel centre (in pixels)
     // [channel R,G,B][x,y]   (y positive downwards)
     float off[3][2] = {{-0.22f, 0.50f}, {0.0f, 0.0f}, {0.27f, 0.52f}};
@@ -125,13 +125,17 @@ struct Config {
     // Experimental: shifts all three channels together (the luminance), in pixels, for panels whose white subpixel
     // moves the brightness away from the colour centroid. 0 = off. Not part of presets.
     float lumX = 0.0f, lumY = 0.0f;
+    // Areas that are flat or only a smooth gradient (window shadows, backgrounds) are left unprocessed: the real
+    // desktop shows through there, so switching between processed and unprocessed tiles cannot show. In 1/255 steps
+    // of the colour range inside the 4x4 filter window; 0 = process everything.
+    int flatSkip = 5;
     int kernel = K_CATMULL;
     int linear = 1;          // process in linear light (physically correct)
     int cleartype = 0;       // ClearType-compatible mode: account for ClearType's own horizontal shift
     int enabled = 1;
     int autoSuspend = 1;     // pause for fullscreen applications
     int overlayAlpha = 255;  // 255: 1:1 pixel composition (sharper). 254: translucent path, fallback
-    wchar_t preset[64] = L"27\" 1440p 240/280 Hz QD-OLED";
+    wchar_t preset[64] = L"27\" 1440p QD-OLED";
     wchar_t gpu[128] = L"";  // empty = the GPU the monitor is connected to
     int fpsCap = 0;          // 0 = unlimited
     int skipUnchanged = 1;   // do not redraw when the desktop reports a change but the pixels are identical
@@ -144,7 +148,7 @@ struct Config {
     int overlayTest = OTF_TEST_DEFAULT;      // [Debug] OverlayTest=1: paint the left third of the overlay magenta (is the overlay visible at all?)
     int diag = OTF_DIAG_DEFAULT;  // write latency / timing statistics to OLEDTextFix.log once per second
     // Experimental (WOLED only): remove the colour ClearType adds to grey text before the subpixel correction.
-    int ctCancel = 0;          // 1 = on (still needs a WOLED preset and 8-bit capture)
+    int ctCancel = 1;          // 1 = on (acts only with a WOLED preset and 8-bit capture)
     bool woled = false;        // the active preset is a WOLED layout (set by ApplyPreset / LoadConfig)
     float ctQ0 = 0.50f, ctQ1 = 0.80f;      // colour-cancellation gate: |mean chroma| / mean |chroma| ramp
     float ctLuma = 0.25f;                  // minimum luma contrast in the 7-px window (text-like edge)
@@ -176,15 +180,11 @@ struct Preset {
 #define WO_RGWB {{-0.50f, 0.0f}, {-0.25f, 0.0f}, {0.22f, 0.0f}}  // R G W B: 6 photos
 
 static const Preset kBuiltinPresets[] = {
-    {L"27\" 1440p 240/280 Hz QD-OLED", QD_27QHD, 0.90f, K_CATMULL, true},
-    {L"27\" 1440p 360 Hz QD-OLED (Gen 3, 2024)", QD_27QHD, 0.90f, K_CATMULL, true},
-    {L"27\" 1440p 500 Hz QD-OLED (Gen 3 update, 2025)", QD_27QHD, 0.90f, K_CATMULL, true},
-    {L"27\" 4K 240 Hz QD-OLED (Gen 4, 2025)", QD_27_4K, 0.90f, K_CATMULL, true},
-    {L"32\" 4K 165 Hz QD-OLED", QD_32_4K, 0.90f, K_CATMULL, true},
-    {L"32\" 4K 240 Hz QD-OLED (Gen 3, 2024)", QD_32_4K, 0.90f, K_CATMULL, true},
-    {L"34\" 3440x1440 165/175 Hz QD-OLED (Gen 1, 2022)", QD_UW34, 0.90f, K_CATMULL, true},
-    {L"34\" 3440x1440 240 Hz QD-OLED (Gen 2, 2024)", QD_UW34, 0.90f, K_CATMULL, true},
-    {L"49\" 5120x1440 144/240 Hz QD-OLED (Gen 2, 2023)", QD_SUW49, 0.90f, K_CATMULL, true},
+    {L"27\" 1440p QD-OLED", QD_27QHD, 0.90f, K_CATMULL, true},
+    {L"27\" 4K QD-OLED", QD_27_4K, 0.90f, K_CATMULL, true},
+    {L"32\" 4K QD-OLED", QD_32_4K, 0.90f, K_CATMULL, true},
+    {L"34\" 3440x1440 QD-OLED", QD_UW34, 0.90f, K_CATMULL, true},
+    {L"49\" 5120x1440 QD-OLED", QD_SUW49, 0.90f, K_CATMULL, true},
     {L"Any QD-OLED triad — vertical only", {{0.0f, 0.50f}, {0.0f, 0.0f}, {0.0f, 0.50f}}, 0.90f, K_CATMULL, true},
     {L"QD-OLED legacy estimate (early QDTextFix default)", {{-0.20f, 0.20f}, {0.0f, -0.20f}, {0.20f, 0.20f}}, 0.90f, K_CATMULL, true},
     // LG WOLED: each pixel is four vertical columns, R W B G (older panels) or R G W B (2024+). Positions
@@ -210,6 +210,24 @@ static const Preset kBuiltinPresets[] = {
 
 
 static std::vector<Preset> g_presets;  // UI thread only
+
+// Presets that shared identical values were merged; settings saved under an old name move to the merged one
+static const wchar_t* CanonicalPresetName(const wchar_t* n) {
+    static const wchar_t* const kOld[][2] = {
+        {L"27\" 1440p 240/280 Hz QD-OLED", L"27\" 1440p QD-OLED"},
+        {L"27\" 1440p 360 Hz QD-OLED (Gen 3, 2024)", L"27\" 1440p QD-OLED"},
+        {L"27\" 1440p 500 Hz QD-OLED (Gen 3 update, 2025)", L"27\" 1440p QD-OLED"},
+        {L"27\" 4K 240 Hz QD-OLED (Gen 4, 2025)", L"27\" 4K QD-OLED"},
+        {L"32\" 4K 165 Hz QD-OLED", L"32\" 4K QD-OLED"},
+        {L"32\" 4K 240 Hz QD-OLED (Gen 3, 2024)", L"32\" 4K QD-OLED"},
+        {L"34\" 3440x1440 165/175 Hz QD-OLED (Gen 1, 2022)", L"34\" 3440x1440 QD-OLED"},
+        {L"34\" 3440x1440 240 Hz QD-OLED (Gen 2, 2024)", L"34\" 3440x1440 QD-OLED"},
+        {L"49\" 5120x1440 144/240 Hz QD-OLED (Gen 2, 2023)", L"49\" 5120x1440 QD-OLED"},
+    };
+    for (const auto& e : kOld)
+        if (wcscmp(n, e[0]) == 0) return e[1];
+    return n;
+}
 
 static Config g_cfg;
 static SRWLOCK g_cfgLock = SRWLOCK_INIT;
@@ -285,6 +303,8 @@ static void LoadConfig() {
     c.diag = IniInt(L"Debug", L"Diagnostics", c.diag);
     c.overlayTest = std::max(0, std::min(2, IniInt(L"Debug", L"OverlayTest", c.overlayTest)));
     GetPrivateProfileStringW(L"General", L"Preset", c.preset, c.preset, 64, g_iniPath);
+    wcsncpy(c.preset, CanonicalPresetName(c.preset), 63);
+    c.preset[63] = 0;
     GetPrivateProfileStringW(L"Performance", L"Gpu", c.gpu, c.gpu, 128, g_iniPath);
     c.fpsCap = IniInt(L"Performance", L"FpsCap", c.fpsCap);
     c.skipUnchanged = IniInt(L"Performance", L"SkipUnchanged", c.skipUnchanged) ? 1 : 0;
@@ -295,6 +315,7 @@ static void LoadConfig() {
     for (int ch = 0; ch < 3; ch++)
         for (int a = 0; a < 2; a++) c.off[ch][a] = IniFloat(L"Subpixel", kChKeys[ch][a], c.off[ch][a]);
     c.strength = IniFloat(L"Filter", L"Strength", c.strength);
+    c.flatSkip = std::max(0, std::min(32, IniInt(L"Filter", L"FlatSkip", c.flatSkip)));
     c.lumX = std::max(-1.0f, std::min(1.0f, IniFloat(L"Filter", L"LumShiftX", c.lumX)));
     c.lumY = std::max(-1.0f, std::min(1.0f, IniFloat(L"Filter", L"LumShiftY", c.lumY)));
     c.kernel = IniInt(L"Filter", L"Kernel", c.kernel);
@@ -339,6 +360,7 @@ static void SaveConfig() {
     for (int ch = 0; ch < 3; ch++)
         for (int a = 0; a < 2; a++) IniPutF(L"Subpixel", kChKeys[ch][a], c.off[ch][a]);
     IniPutF(L"Filter", L"Strength", c.strength);
+    IniPutI(L"Filter", L"FlatSkip", c.flatSkip);
     IniPutF(L"Filter", L"LumShiftX", c.lumX);
     IniPutF(L"Filter", L"LumShiftY", c.lumY);
     IniPutI(L"Filter", L"Kernel", c.kernel);
@@ -401,7 +423,7 @@ static void DeleteUserPreset(const std::wstring& name) {
 
 // ---------------------------------------------------------------- global state
 
-enum Status { ST_STARTING, ST_ACTIVE, ST_DISABLED, ST_FULLSCREEN, ST_HDR, ST_WAITING, ST_ERROR, ST_FORMAT };
+enum Status { ST_STARTING, ST_ACTIVE, ST_DISABLED, ST_FULLSCREEN, ST_HDR, ST_ACM, ST_WAITING, ST_ERROR, ST_FORMAT };
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_forceRedraw{true};
 static std::atomic<bool> g_bypass{false};
@@ -429,7 +451,6 @@ struct OutInfo {
     std::wstring name;
     RECT rc{};
     HMONITOR mon = nullptr;
-    bool samsung = false;
     bool primary = false;
     std::wstring device;  // GDI device name, e.g. \\.\DISPLAY1
 };
@@ -463,12 +484,10 @@ static std::vector<OutInfo> EnumOutputs() {
             std::wstring friendly = L"Monitor";
             if (EnumDisplayDevicesW(d.DeviceName, 0, &dd, 0)) {
                 friendly = dd.DeviceString;
-                if (wcsstr(dd.DeviceID, L"SAM")) oi.samsung = true;
             }
             wchar_t buf[256];
-            swprintf(buf, 256, L"%ls — %ldx%ld%ls%ls", friendly.c_str(), d.DesktopCoordinates.right - d.DesktopCoordinates.left,
-                     d.DesktopCoordinates.bottom - d.DesktopCoordinates.top, oi.primary ? L" (primary)" : L"",
-                     oi.samsung ? L" [Samsung]" : L"");
+            swprintf(buf, 256, L"%ls — %ldx%ld%ls", friendly.c_str(), d.DesktopCoordinates.right - d.DesktopCoordinates.left,
+                     d.DesktopCoordinates.bottom - d.DesktopCoordinates.top, oi.primary ? L" (primary)" : L"");
             oi.name = buf;
             v.push_back(oi);
         }
@@ -479,8 +498,6 @@ static std::vector<OutInfo> EnumOutputs() {
 static int PickOutput(const std::vector<OutInfo>& v, int want) {
     if (v.empty()) return -1;
     if (want >= 0 && want < (int)v.size()) return want;
-    for (size_t i = 0; i < v.size(); i++)
-        if (v[i].samsung) return (int)i;
     for (size_t i = 0; i < v.size(); i++)
         if (v[i].primary) return (int)i;
     return 0;
@@ -512,7 +529,7 @@ cbuffer CB : register(b0) {
     float4 wxR, wxG, wxB;
     float4 wyR, wyG, wyB;
     int4 sz;
-    int4 tileInfo;  // x = tile size
+    int4 tileInfo;  // x = tile size, y = scRGB, z = test mode, w = flat-area threshold (1/255 steps; < 0: raw values, > 0: linear light)
 };
 Texture2D<float> motionMask : register(t1);  // 1 = this tile is currently moving
 
@@ -538,13 +555,27 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target {
     // Moving region: leave fully transparent so the real desktop shows through without latency
     if (motionMask.Load(int3(p / tileInfo.x, 0)) > 0.5) return float4(0, 0, 0, 0);
     float r = 0, g = 0, b = 0;
+    float3 lo = float3(1e9, 1e9, 1e9), hi = float3(-1e9, -1e9, -1e9);
     [unroll] for (int j = 0; j < 4; j++) {
         [unroll] for (int i = 0; i < 4; i++) {
             int2 o = int2(i, j);
-            r += wxR[i] * wyR[j] * tex.Load(int3(clamp(p + baseR.xy + o, int2(0, 0), sz.xy), 0)).r;
-            g += wxG[i] * wyG[j] * tex.Load(int3(clamp(p + baseG.xy + o, int2(0, 0), sz.xy), 0)).g;
-            b += wxB[i] * wyB[j] * tex.Load(int3(clamp(p + baseB.xy + o, int2(0, 0), sz.xy), 0)).b;
+            float sr = tex.Load(int3(clamp(p + baseR.xy + o, int2(0, 0), sz.xy), 0)).r;
+            float sg = tex.Load(int3(clamp(p + baseG.xy + o, int2(0, 0), sz.xy), 0)).g;
+            float sb = tex.Load(int3(clamp(p + baseB.xy + o, int2(0, 0), sz.xy), 0)).b;
+            r += wxR[i] * wyR[j] * sr;
+            g += wxG[i] * wyG[j] * sg;
+            b += wxB[i] * wyB[j] * sb;
+            float3 sv = float3(sr, sg, sb);
+            lo = min(lo, sv);
+            hi = max(hi, sv);
         }
+    }
+    // Flat or smoothly graded area (window shadow, background): nothing to correct, show the real desktop
+    if (tileInfo.w != 0) {
+        float3 a = lo, bb = hi;
+        if (tileInfo.w > 0) { a = sqrt(max(a, 0.0)); bb = sqrt(max(bb, 0.0)); }  // linear light -> roughly perceptual
+        float3 rg = bb - a;
+        if (max(rg.x, max(rg.y, rg.z)) < abs(tileInfo.w) / 255.0) return float4(0, 0, 0, 0);
     }
     // HDR / Advanced Color desktops are scRGB (linear, FP16): values above 1 and below 0 are valid
     if (tileInfo.y != 0) return float4(r, g, b, 1.0);
@@ -1147,6 +1178,15 @@ struct Renderer {
         DXGI_OUTDUPL_DESC dd{};
         dup->GetDesc(&dd);
         const DXGI_FORMAT f = dd.ModeDesc.Format;
+        if (!hdrOn && f == DXGI_FORMAT_R16G16B16A16_FLOAT && !GetCfg().hdr) {
+            // Auto Color Management (SDR output, 16-bit desktop): the overlay comes out black or far too dark here, so
+            // leave the desktop alone rather than show a wrong picture
+            static bool logged = false;
+            if (!logged) { logged = true; Log("Auto Color Management is on: paused (the 16-bit desktop is not supported yet)"); }
+            dup.reset();
+            g_status = ST_ACM;
+            return false;
+        }
         if (f != DXGI_FORMAT_B8G8R8A8_UNORM && f != DXGI_FORMAT_R10G10B10A2_UNORM && f != DXGI_FORMAT_R16G16B16A16_FLOAT) {
             Log("Unsupported desktop format %d", (int)f);
             dup.reset();
@@ -1450,6 +1490,12 @@ struct Renderer {
         d.size[1] = (int)h - 1;
         d.tile[0] = TILE;
         d.tile[2] = c.overlayTest;
+        {
+            Com<ID3D11RenderTargetView>* v0 = cross ? outRtv : rtv;
+            bool lin0 = c.linear && srv[cur][1] && v0[1];
+            bool scrgb = capFmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            d.tile[3] = (c.flatSkip > 0 && !bypass && !ctOn && !scrgb) ? (lin0 ? c.flatSkip : -c.flatSkip) : 0;
+        }
         d.tile[1] = capFmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 0;  // scRGB: no clamping
         ctx->UpdateSubresource(maskTex.get(), 0, nullptr, mask.data(), (UINT)tw, 0);
         lastMask = mask;
@@ -1618,7 +1664,7 @@ struct Renderer {
             if (!dup) {
                 if (!StartDuplication()) {
                     Hide("capture could not start / HDR");
-                    Sleep(g_status == ST_HDR ? 1000 : 250);
+                    Sleep(g_status == ST_HDR || g_status == ST_ACM ? 1000 : 250);
                     continue;
                 }
                 g_forceRedraw = true;
@@ -1891,6 +1937,7 @@ static const wchar_t* StatusText() {
         case ST_DISABLED: return L"Off";
         case ST_FULLSCREEN: return L"Fullscreen application — paused";
         case ST_HDR: return L"HDR is on — paused (turn on Experimental HDR in Settings)";
+        case ST_ACM: return L"Auto Color Management is on — paused (turn it off in Windows display settings)";
         case ST_FORMAT: return L"Unsupported desktop colour format — paused (see log)";
         case ST_WAITING: return L"Waiting for capture";
         case ST_ERROR: return L"Error — see OLEDTextFix.log";
@@ -2464,7 +2511,7 @@ static void CreateControls() {
     g_ui.pattern = CreateWindowExW(0, L"OLEDTextFixPattern", L"", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, g_ui.wnd, nullptr, g_inst, nullptr);
 
     g_ui.outs = EnumOutputs();
-    SendMessageW(g_ui.cmbMon, CB_ADDSTRING, 0, (LPARAM)L"Automatic (Samsung first)");
+    SendMessageW(g_ui.cmbMon, CB_ADDSTRING, 0, (LPARAM)L"Automatic (primary display)");
     for (auto& o : g_ui.outs) SendMessageW(g_ui.cmbMon, CB_ADDSTRING, 0, (LPARAM)o.name.c_str());
 }
 
@@ -2919,24 +2966,20 @@ static void AutoPickPreset() {
     if (w == 2560 && h == 1440)
         name = (hz >= 470 && hz <= 490) ? L"27\" 1440p 480 Hz WOLED — RGWB (2024-2025)"  // QD-OLED is 360 or 500 Hz
              : lg                       ? L"27\" 1440p 240 Hz WOLED — RWBG (2023-2024)"
-             : hz >= 450                ? L"27\" 1440p 500 Hz QD-OLED (Gen 3 update, 2025)"
-             : hz >= 300                ? L"27\" 1440p 360 Hz QD-OLED (Gen 3, 2024)"
-                                        : L"27\" 1440p 240/280 Hz QD-OLED";
+                                        : L"27\" 1440p QD-OLED";
     else if (w == 3840 && h == 2160)
-        name = widthMm > 650 ? (lg ? L"32\" 4K 240 Hz WOLED — RGWB (2024-2025)"
-                                   : hz > 200 ? L"32\" 4K 240 Hz QD-OLED (Gen 3, 2024)" : L"32\" 4K 165 Hz QD-OLED")
+        name = widthMm > 650 ? (lg ? L"32\" 4K 240 Hz WOLED — RGWB (2024-2025)" : L"32\" 4K QD-OLED")
              : lg ? L"RGB stripe (Tandem RGB WOLED / QD-OLED V-Stripe) — no correction"  // LG 27" 4K OLED: RGB stripe
-                  : L"27\" 4K 240 Hz QD-OLED (Gen 4, 2025)";
+                  : L"27\" 4K QD-OLED";
     else if (w == 3440 && h == 1440)
         name = widthMm > 950 ? L"45\" 3440x1440 240 Hz WOLED — RWBG (2023-2024)"
              : widthMm > 850 ? L"39\" 3440x1440 240 Hz WOLED — RWBG (2024)"  // QD-OLED ultrawides are 34"
              : lg            ? L"34\" 3440x1440 240 Hz WOLED — RWBG (2024)"
-             : hz > 200      ? L"34\" 3440x1440 240 Hz QD-OLED (Gen 2, 2024)"
-                             : L"34\" 3440x1440 165/175 Hz QD-OLED (Gen 1, 2022)";
+                             : L"34\" 3440x1440 QD-OLED";
     else if (w == 5120 && h == 2160)
         name = widthMm > 980 ? L"45\" 5120x2160 165 Hz WOLED — RGWB (2025)" : L"39\" 5120x2160 Tandem WOLED — RGWB (2026)";
     else if (w == 5120 && h == 1440)
-        name = L"49\" 5120x1440 144/240 Hz QD-OLED (Gen 2, 2023)";
+        name = L"49\" 5120x1440 QD-OLED";
     Log("Monitor: %ls, %dx%d, %d Hz, %d mm wide -> preset: %ls", mfg, w, h, hz, widthMm, name ? name : L"(default)");
     if (name) {
         ApplyPreset(FindPreset(name));
